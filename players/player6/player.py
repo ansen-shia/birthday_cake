@@ -213,20 +213,14 @@ class Player6(Player):
             
 
     def get_cuts(self) -> list[tuple[Point, Point]]:
-        """Generate cuts to divide the cake among children using alternating x and y slices."""
-        print(f"DEBUG: Starting get_cuts for {self.children} children")
-        print(f"DEBUG: Cake bounds: {self.cake.exterior_shape.bounds}")
-        
         min_x, min_y, max_x, max_y = self.cake.exterior_shape.bounds
         result: list[tuple[Point, Point]] = []
-        largest_piece = self.get_max_piece(self.cake.exterior_pieces)
-        
-        print(f"DEBUG: Initial largest piece area: {largest_piece.area}")
-        
-        # Generate cuts incrementally
+        largest_piece = self.get_max_piece(self.cake.exterior_pieces) # Generate cuts incrementally
+        total_area = self.cake.get_area()
+        ideal_area = total_area / self.children
         for i in range(1, self.children):
-            print(f"\nDEBUG: === Cut {i}/{self.children-1} ===")
-            
+            # make n-1 cuts
+            # cut of piece of size 1/n, then another of size 1/n, etc - swiping along x-axis or y-axis of largest piece
             # Try x-slice first, then y-slice if x fails
             cut_result_1 = self._try_x_slice(i, min_x, max_x, min_y, max_y, largest_piece)
             cut_result_2 = self._try_y_slice(i, min_x, max_x, min_y, max_y, largest_piece)
@@ -247,23 +241,34 @@ class Player6(Player):
         print(f"DEBUG: Generated {len(result)} cuts: {result}")
         return result
     
-    def _try_x_slice(self, iteration: int, min_x: float, max_x: float, 
-                     min_y: float, max_y: float, piece: Polygon) -> CutResult | None:
-        """Attempt to make a vertical cut at the given iteration."""
-        x_position = iteration / self.children * (max_x - min_x) + min_x
+    def _try_x_slice(self, x_position: float, min_x: float, 
+                     min_y: float, max_y: float, child_area: float, piece: Polygon):
+        # find leftmost point on the polygon? - it will be a vertice - no matter what - or two vertices if it's a flat edge
+        # do vertice with the lowest x and y - because that is always the direction we head in
+        # increment by 0.1 with every iteration
         x_slice = LineString([[x_position, min_y], [x_position, max_y]])
+        intersection = intersection(x_slice, piece)
+        print(intersection.geom_type)
+
+
+    
+    # def _try_x_slice(self, iteration: int, min_x: float, max_x: float, 
+    #                  min_y: float, max_y: float, piece: Polygon) -> CutResult | None:
+    #     """Attempt to make a vertical cut at the given iteration."""
+    #     x_position = iteration / self.children * (max_x - min_x) + min_x
+    #     x_slice = LineString([[x_position, min_y], [x_position, max_y]])
         
-        print(f"DEBUG: Trying x-slice at x={x_position}")
+    #     print(f"DEBUG: Trying x-slice at x={x_position}")
         
-        # Find intersection with the piece
-        intersections = intersection(x_slice, piece)
-        if isinstance(intersections, LineString) and not intersections.is_empty:
-            x_slice = intersections
-            print(f"DEBUG: X-slice intersects piece: {x_slice}")
-            return self.virtual_cut(piece, x_slice)
-        else:
-            print(f"DEBUG: X-slice doesn't intersect piece properly: {intersections}")
-            return None
+    #     # Find intersection with the piece
+    #     intersections = intersection(x_slice, piece)
+    #     if isinstance(intersections, LineString) and not intersections.is_empty:
+    #         x_slice = intersections
+    #         print(f"DEBUG: X-slice intersects piece: {x_slice}")
+    #         return self.virtual_cut(piece, x_slice)
+    #     else:
+    #         print(f"DEBUG: X-slice doesn't intersect piece properly: {intersections}")
+    #         return None
     
     def _try_y_slice(self, iteration: int, min_x: float, max_x: float,
                      min_y: float, max_y: float, piece: Polygon) -> CutResult | None:
