@@ -247,8 +247,61 @@ class Player6(Player):
         # do vertice with the lowest x and y - because that is always the direction we head in
         # increment by 0.1 with every iteration
         x_slice = LineString([[x_position, min_y], [x_position, max_y]])
-        intersection = intersection(x_slice, piece)
-        print(intersection.geom_type)
+        intersection_points = intersection(x_slice, piece)
+        point_1 = Point(x_position, min_y)
+        point_2 = Point(x_position, max_y)
+        if intersection_points.geom_type == 'Point':
+            point_1 = intersection_points
+            point_2= intersection_points
+        elif intersection_points.geom_type == 'LineString':
+            point_1 = Point(intersection_points.coords[0][0], intersection_points.coords[0][1])
+            point_2= Point(intersection_points.coords[1][0], intersection_points.coords[1][1])
+        else:
+            # no multiple intersecting sections yet
+            return None
+        copy_piece = piece.copy()
+        bound = copy_piece.boundary
+        a = bound.interpolate(bound.project(point_1))
+        b = bound.interpolate(bound.project(point_2))
+
+        line = LineString([a, b])
+        # ensure that the line extends beyond the piece
+        # line = extend_line(line)
+
+        split_piece = split(copy_piece, line)
+        print(split_piece)
+        split_pieces: list[Polygon] = [
+            cast(Polygon, geom) for geom in split_piece.geoms
+        ]
+        while (split_piece[0].area < child_area - 0.25):
+            x_position += 0.01
+            x_slice = LineString([[x_position, min_y], [x_position, max_y]])
+            intersection_points = intersection(x_slice, piece)
+            point_1 = Point(x_position, min_y)
+            point_2 = Point(x_position, max_y)
+            if intersection_points.geom_type == 'Point':
+                point_1 = intersection_points
+                point_2= intersection_points
+            elif intersection_points.geom_type == 'LineString':
+                point_1 = Point(intersection_points.coords[0][0], intersection_points.coords[0][1])
+                point_2= Point(intersection_points.coords[1][0], intersection_points.coords[1][1])
+            else:
+                # no multiple intersecting sections yet
+                return None
+            copy_piece = piece.copy()
+            bound = copy_piece.boundary
+            a = bound.interpolate(bound.project(point_1))
+            b = bound.interpolate(bound.project(point_2))
+
+        line = LineString([a, b])
+        # ensure that the line extends beyond the piece
+        # line = extend_line(line)
+
+        split_piece = split(copy_piece, line)
+        print(split_piece)
+        split_pieces: list[Polygon] = [
+            cast(Polygon, geom) for geom in split_piece.geoms
+        ]
 
 
     
