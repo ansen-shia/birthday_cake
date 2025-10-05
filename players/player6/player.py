@@ -6,15 +6,17 @@ from shapely import MultiLineString, intersection
 from shapely.ops import split
 from typing import cast
 import numpy as np
-from math import hypot
+from math import hypot, ceil
 
 import src.constants as c
-
+from typing import List, Optional, Tuple
+from math import isclose, tan, cos, sin, pi
+from joblib import Parallel, delayed
 
 @dataclass
 class CutResult:
-    polygons: list[Polygon]
-    points: tuple[Point, Point]
+    polygons: List[Polygon]
+    points: Tuple[Point, Point]
 
 
 def extend_line(line: LineString, fraction: float = 0.05) -> LineString:
@@ -46,7 +48,7 @@ class Player6(Player):
             self.cake.interior_shape.area / self.cake.exterior_shape.area
         )
 
-    def find_common_points(self, pieces: list[Polygon]) -> tuple[tuple[float, float]]:
+    def find_common_points(self, pieces: List[Polygon]) -> Tuple[float, float]:
         """Find the vertices of the new cake polygon once cut"""
         return tuple(set(pieces[0].exterior.coords) & set(pieces[1].exterior.coords))
 
@@ -54,7 +56,7 @@ class Player6(Player):
         outside = cut.difference(polygon.buffer(c.TOL * 2))
         return outside.is_empty
 
-    def get_intersecting_pieces_from_point(self, p: Point, polygons: list[Polygon]):
+    def get_intersecting_pieces_from_point(self, p: Point, polygons: List[Polygon]):
         touched_pieces = [
             piece for piece in polygons if self.point_lies_on_piece_boundary(p, piece)
         ]
@@ -87,7 +89,7 @@ class Player6(Player):
     def point_lies_on_piece_boundary(self, p: Point, piece: Polygon):
         return p.distance(piece.boundary) <= c.TOL
 
-    def get_cuttable_piece(self, from_p: Point, to_p: Point, polygons: list[Polygon]):
+    def get_cuttable_piece(self, from_p: Point, to_p: Point, polygons: List[Polygon]):
         a_pieces = self.get_intersecting_pieces_from_point(from_p, polygons)
         b_pieces = self.get_intersecting_pieces_from_point(to_p, polygons)
 
@@ -135,7 +137,7 @@ class Player6(Player):
 
     def cut_is_valid(
         self, from_p: Point, to_p: Point, polygon: Polygon
-    ) -> tuple[bool, str]:
+    ) -> Tuple[bool, str]:
         """Check whether a cut from `from_p` to `to_p` is valid.
 
         If invalid, the method returns the reason as the second argument.
@@ -187,7 +189,7 @@ class Player6(Player):
         # line = extend_line(line)
         # cut the cake
         split_piece = split(piece, line)
-        split_pieces: list[Polygon] = [
+        split_pieces: List[Polygon] = [
             cast(Polygon, geom) for geom in split_piece.geoms
         ]
         # point1, point2 = line.coords
@@ -212,7 +214,7 @@ class Player6(Player):
             return inter.area / piece.area if not inter.is_empty else 0
         return 0
 
-    def score_cut(self, cut: CutResult) -> tuple[float, float]:
+    def score_cut(self, cut: CutResult) -> Tuple[float, float]:
         if cut is None:
             return (float("inf"), float("inf"))
 
@@ -221,100 +223,103 @@ class Player6(Player):
         if len(polygons) != 2:
             return (float("inf"), float("inf"))
 
-        area_scores = [abs(polygon.area - self.target_area) for polygon in polygons]
+        area_scores = [max(0, abs(polygon.area - self.target_area) - 0.125) for polygon in polygons]
         ratio_scores = [
-            abs(self.get_piece_ratio(polygon) - self.target_ratio)
+            max(0, abs(self.get_piece_ratio(polygon) - self.target_ratio) - 0.05)
             for polygon in polygons
         ]
 
         area_score = min(area_scores)
         ratio_score = ratio_scores[area_scores.index(min(area_scores))]
 
-        # If difference from target area < 0.125, treat it as equal → rely on ratio
-        if area_score <= 0.125:
-            area_score = 0.0
-        if ratio_score <= 0.05:
-            ratio_score = 0.0
         return (area_score, ratio_score)
 
-    def get_cuts(self) -> list[tuple[Point, Point]]:
-        """Adaptive coarse-to-fine search for near-optimal cuts with convergence criteria."""
-        result: list[tuple[Point, Point]] = []
+    def find_best_slice(self):
+        largest_piece = self.get_max_piece(self.cake.exterior_pieces)
+        x1,y1,x2,y2 = largest_piece.bounds
+        cut_fracs = np.linspace(0.01, 0.99, ceil(max(y2-y1, x2-x1)*10))
+        cut_angles = np.linspace(-1, 1, 360)
+
+        results = Parallel(n_jobs=-1)(
+            delayed(self._evaluate_pair)(largest_piece, frac, angle)
+            for frac in cut_fracs for angle in cut_angles
+        )
+
+        best_slice, best_score = min(
+            ((cut, score) for cut, score in results if cut is not None),
+            key=lambda x: x[1],
+            default=(None, (float("inf"), float("inf")))
+        )
+        return best_slice
+
+    def _evaluate_pair(self, piece, frac, angle):
+        line = self.generate_cut_line(piece, angle, frac)
+        cuts = self.intersect_cut_line(piece, line)
+        if not cuts:
+            return None, (float("inf"), float("inf"))
+        best_cut, best_score = None, (float("inf"), float("inf"))
+        for cut in cuts:
+            if cut is None:
+                continue
+            score = self.score_cut(cut)
+            if score < best_score:
+                best_cut, best_score = cut, score
+        return best_cut, best_score
+
+    def get_cuts(self) -> List[Tuple[Point, Point]]:
+        result: List[Tuple[Point, Point]] = []
 
         while len(result) < self.children - 1:
-            largest_piece = self.get_max_piece(self.cake.exterior_pieces)
-            min_x, min_y, max_x, max_y = largest_piece.exterior.bounds
-            cut_fracs = np.linspace(0.01, 1, 1000)
-            best_slice, best_score = None, (float("inf"), float("inf"))
-
-            for frac in cut_fracs:
-                for try_fn in (self._try_x_slice, self._try_y_slice):
-                    cuts = try_fn(
-                        frac * self.children, min_x, max_x, min_y, max_y, largest_piece
-                    )
-                    if not cuts:
-                        continue
-                    for cut in cuts:
-                        if cut is None:
-                            continue
-                        score = self.score_cut(cut)
-                        if score < best_score:
-                            best_score, best_slice = score, cut
-
-            if not best_slice:
-                continue
-
+            
+            best_slice = self.find_best_slice()
             if best_slice:
                 result.append(best_slice.points)
                 self.cake.cut(best_slice.points[0], best_slice.points[1])
+            else:
+                break
 
         return result
 
-    def _try_x_slice(
-        self,
-        iteration: int,
-        min_x: float,
-        max_x: float,
-        min_y: float,
-        max_y: float,
-        piece: Polygon,
-    ) -> list[CutResult] | None:
-        """Attempt to make a vertical cut at the given iteration."""
-        x_span = max_x - min_x
-        x_position = iteration * x_span / self.children + min_x
-        x_slice = LineString([[x_position, min_y], [x_position, max_y]])
 
-        # Find intersection with the piece
-        intersections = intersection(x_slice, piece)
-        if isinstance(intersections, MultiLineString) and not intersections.is_empty:
-            return [self.virtual_cut(piece, line) for line in intersections.geoms]
-        if isinstance(intersections, LineString) and not intersections.is_empty:
-            return [self.virtual_cut(piece, intersections)]
-        else:
+    def intersect_cut_line(self, piece: Polygon, line: LineString) -> Optional[List['CutResult']]:
+        """
+        Intersect the line with the polygon and return virtual cuts.
+        Returns None if no intersection.
+        """
+        intersections = intersection(line, piece)
+        if intersections.is_empty:
             return None
 
-    def _try_y_slice(
-        self,
-        iteration: int,
-        min_x: float,
-        max_x: float,
-        min_y: float,
-        max_y: float,
-        piece: Polygon,
-    ) -> CutResult | None:
-        """Attempt to make a horizontal cut at the given iteration."""
-        y_span = max_y - min_y
-        y_position = iteration * y_span / self.children + min_y
-        y_slice = LineString([[min_x, y_position], [max_x, y_position]])
-
-        # Find intersection with the piece
-        intersections = intersection(y_slice, piece)
-        if isinstance(intersections, MultiLineString) and not intersections.is_empty:
-            return [self.virtual_cut(piece, line) for line in intersections.geoms]
-        if isinstance(intersections, LineString) and not intersections.is_empty:
+        if isinstance(intersections, MultiLineString):
+            return [self.virtual_cut(piece, seg) for seg in intersections.geoms]
+        
+        if isinstance(intersections, LineString):
             return [self.virtual_cut(piece, intersections)]
-        else:
-            return None
 
-    def get_max_piece(self, pieces: list[Polygon]) -> Polygon:
+        return None
+
+
+    def generate_cut_line(self, piece: Polygon, angle: float, iteration: int) -> LineString:
+        """
+        Generate a LineString for a given angle (fraction of pi) and sweep fraction (iteration).
+        Handles vertical and horizontal lines robustly.
+        """
+        min_x, min_y, max_x, max_y = piece.bounds
+        offset_fraction = iteration / self.children
+        theta = angle * pi
+
+        # When cos(theta) is very small → vertical line
+        if isclose(abs(cos(theta)), 0, abs_tol=1e-6):
+            # Use x = constant line
+            x_const = min_x + offset_fraction * (max_x - min_x)
+            return LineString([(x_const, min_y), (x_const, max_y)])
+        else:
+            # Regular slope-intercept form
+            slope = tan(theta)
+            intercept = min_y + offset_fraction * (max_y - min_y)
+            x1, x2 = min_x, max_x
+            y1, y2 = slope * x1 + intercept, slope * x2 + intercept
+            return LineString([(x1, y1), (x2, y2)])
+
+    def get_max_piece(self, pieces: List[Polygon]) -> Polygon:
         return max(pieces, key=lambda piece: piece.area)
