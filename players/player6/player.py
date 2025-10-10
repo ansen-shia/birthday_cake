@@ -395,9 +395,17 @@ class Player6(Player):
     def get_cuts(self) -> list[tuple[Point, Point]]:
         """Adaptive coarse-to-fine search for near-optimal cuts with multiple angles using parallel processing."""
         result = self.get_cuts_divide_conquer()
-        if not result:
-            return []
-        return result
+        # if divide conquer works use it
+        # NOTE: ensure doesn't modify original if we need to fall back
+        if result and len(result) == self.children - 1:
+            # apply all the cuts to the actual cake
+            for from_p, to_p in result:
+                self.cake.cut(from_p, to_p)
+            return result
+        
+        print(f"Divide and conquer got only {len(result) if result else 0} cuts, falling back to greedy")
+
+        # fall back to original greedy
         result: list[tuple[Point, Point]] = []
 
         while len(result) < self.children - 1:
@@ -464,16 +472,31 @@ class Player6(Player):
             
             if not best_slice:
                 # probably another check better
-                return result
+                return []
             
-            pieces = self.virtual_cut(piece, LineString(best_slice.points)).polygons
+            #pieces = self.virtual_cut(piece, LineString(best_slice.points)).polygons
+            #pieces.sort(key = lambda piece: piece.area)
+
+            # don't use .polygons here yet
+            cut_result = self.virtual_cut(piece, LineString(best_slice.points))
+            if cut_result is None or len(cut_result.polygons) != 2:
+                # Cut failed or didn't produce exactly 2 pieces
+                return []
+            # now apply it
+            pieces = cut_result.polygons
             pieces.sort(key = lambda piece: piece.area)
             
             result.append(best_slice.points)
-            self.cake.cut(best_slice.points[0], best_slice.points[1])
+
+            # dont modify for now in case we need to backup to greedy
+            #self.cake.cut(best_slice.points[0], best_slice.points[1])
             
             large_result = self.divide_and_conquer(pieces[1], ceil(n_children / 2))
             small_result = self.divide_and_conquer(pieces[0], floor(n_children / 2))
+
+            # check for failure
+            if small_result is None or large_result is None:
+                return []
             
             return result + small_result + large_result
         
