@@ -262,10 +262,11 @@ class Player6(Player):
         iterations = 0
         # NOTE: tune later
         max_iterations = 20
+        
+        best_candidates = []
+        k = 10
 
-        while right - left > epsilon and iterations < max_iterations:
-            iterations += 1
-
+        for iter in range(max_iterations):
             mid1 = left + (right - left) / 3
             mid2 = right - (right - left) / 3
 
@@ -276,17 +277,29 @@ class Player6(Player):
                 try_fn, mid2, min_x, max_x, min_y, max_y, piece
             )
 
+            for cut, score, pos in [(cut1, score1, mid1), (cut2, score2, mid2)]:
+                if cut is not None:
+                    # insert into best_candidates sorted by score
+                    best_candidates.append((score, cut, pos))
+                    # keep only top k by score
+                    best_candidates = sorted(best_candidates)[:k]
+
+            """
             if score1 < best_score:
                 best_cut, best_score = cut1, score1
             if score2 < best_score:
                 best_cut, best_score = cut2, score2
+            """
 
             if score1 < score2:
                 right = mid2
             else:
                 left = mid1
 
-        return best_cut, best_score
+            if right - left < epsilon:
+                break
+
+        return best_candidates
 
     def intersect_cut_line(
         self, piece: Polygon, line: LineString
@@ -363,6 +376,7 @@ class Player6(Player):
         max_y: float,
     ) -> tuple[CutResult, tuple[float, float]]:
         """Evaluate a single angle using ternary search - helper for parallel processing"""
+        """
         cut, score = self.ternary_search_cut(
             lambda pos, min_x, max_x, min_y, max_y, piece: self._try_angle_slice(
                 pos, min_x, max_x, min_y, max_y, piece, angle
@@ -373,7 +387,24 @@ class Player6(Player):
             max_y,
             largest_piece,
         )
-        return cut, score
+        """
+        candidates = self.ternary_search_cut(
+            lambda pos, min_x, max_x, min_y, max_y, piece: self._try_angle_slice(
+                pos, min_x, max_x, min_y, max_y, piece, angle
+            ),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            largest_piece,
+        )
+
+        # pick the final best candidate
+        best_cut, score = None, (float("inf"), float("inf"))
+        for s, cut, pos in candidates:
+            if cut is not None and s < score:
+                best_cut, score = cut, s
+        return best_cut, score
 
     def get_cuts(self) -> list[tuple[Point, Point]]:
         """Adaptive coarse-to-fine search for near-optimal cuts with multiple angles using parallel processing."""
@@ -478,7 +509,7 @@ class Player6(Player):
         n_children: int,
     ) -> tuple[CutResult, tuple[float, float]]:
         """Evaluate a single angle using ternary search - helper for parallel processing"""
-        cut, score = self.ternary_search_cut_n(
+        candidates = self.multistart_ternary_search_n(
             lambda pos, min_x, max_x, min_y, max_y, piece: self._try_angle_slice(
                 pos, min_x, max_x, min_y, max_y, piece, angle
             ),
@@ -489,7 +520,13 @@ class Player6(Player):
             largest_piece,
             n_children,
         )
-        return cut, score
+
+        # pick the final best candidate
+        best_cut, score = None, (float("inf"), float("inf"))
+        for s, cut, pos in candidates:
+            if cut is not None and s < score:
+                best_cut, score = cut, s
+        return best_cut, score
 
     def ternary_search_cut_n(
         self,
@@ -504,13 +541,15 @@ class Player6(Player):
     ) -> tuple[CutResult, tuple[float, float]]:
         """Ternary search for the optimal cut positio based on the slicing function to try, returns best cut and its score"""
         left, right = 0.01, 0.99
-        best_cut, best_score = None, (float("inf"), float("inf"))
-        iterations = 0
+        #best_cut, best_score = None, (float("inf"), float("inf"))
+        #iterations = 0
         # NOTE: tune later
         max_iterations = 20
 
-        while right - left > epsilon and iterations < max_iterations:
-            iterations += 1
+        k = 10
+        best_candidates = []
+        for iter in range(max_iterations):
+            #iterations += 1
 
             mid1 = left + (right - left) / 3
             mid2 = right - (right - left) / 3
@@ -522,17 +561,29 @@ class Player6(Player):
                 try_fn, mid2, min_x, max_x, min_y, max_y, piece, n_children
             )
 
+            for cut, score, pos in [(cut1, score1, mid1), (cut2, score2, mid2)]:
+                if cut is not None:
+                    # insert into best_candidates sorted by score
+                    best_candidates.append((score, cut, pos))
+                    # keep only top k by score
+                    best_candidates = sorted(best_candidates)[:k]
+
+            """
             if score1 < best_score:
                 best_cut, best_score = cut1, score1
             if score2 < best_score:
                 best_cut, best_score = cut2, score2
+            """
 
             if score1 < score2:
                 right = mid2
             else:
                 left = mid1
 
-        return best_cut, best_score
+            if right - left < epsilon:
+                break
+
+        return best_candidates
 
     def positions_best_cut_n(
         self,
@@ -585,10 +636,65 @@ class Player6(Player):
         # ratio_score = ratio_scores[area_scores.index(min(area_scores))]
 
         # If difference from target area < 0.125, treat it as equal → rely on ratio
-        if area_score < 0.25:
+        if area_score < 0.245:
             area_score = 0.0
         if ratio_score <= 0.05:
             ratio_score = 0.0
 
         # adding line length as the last factor as after dividing area equally we would love to have more interior !
         return (area_score, ratio_score, 1/LineString(cut.points).length)
+    
+
+    def multistart_ternary_search_n(
+        self,
+        try_fn,
+        min_x: float,
+        max_x: float,
+        min_y: float,
+        max_y: float,
+        piece: Polygon,
+        n_children: int,
+        n_starts: int = 5,
+    ) -> List[tuple[tuple[float, float], CutResult, float]]:
+        """
+        Try multiple ternary searches from different starting regions.
+        """
+        best_candidates = []
+        # divide search space into n starting regions
+        starts = np.linspace(0.05, 0.95, n_starts + 1)
+        # iterations per region
+        iterations = 10
+
+        for i in range(n_starts):
+            # Run ternary search in this sub-region
+            left, right = starts[i], starts[i + 1]
+            
+            # ternary search in current subregion
+            for _ in range(iterations): 
+                # NOTE: check later - stopping once search interval < 0.01 of the normalized domain
+                if right - left < 0.01:
+                    break
+                    
+                mid1 = left + (right - left) / 3
+                mid2 = right - (right - left) / 3
+                
+                cut1, score1 = self.positions_best_cut_n(
+                    try_fn, mid1, min_x, max_x, min_y, max_y, piece, n_children
+                )
+                cut2, score2 = self.positions_best_cut_n(
+                    try_fn, mid2, min_x, max_x, min_y, max_y, piece, n_children
+                )
+                
+                if cut1:
+                    best_candidates.append((score1, cut1, mid1))
+                if cut2:
+                    best_candidates.append((score2, cut2, mid2))
+                
+                if score1 < score2:
+                    right = mid2
+                else:
+                    left = mid1
+        
+        # sort top candidates and return to evaluate_ange
+        best_candidates = sorted(best_candidates, key=lambda x: x[0])
+        return best_candidates[:10]
