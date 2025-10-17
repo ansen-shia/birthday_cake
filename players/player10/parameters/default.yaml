@@ -1,0 +1,25 @@
+# Default parameters for Player10 cake cutting algorithm
+# This file can be copied and modified to create custom configurations
+
+# Algorithm parameters
+number_attempts: 90  # Number of (ratio, angle) attempts per cut in divide-and-conquer
+
+# Gradient descent post-processing parameters
+gradient_descent:
+  n_iterations: 30  # Number of gradient descent iterations
+  position_learning_rate: 0.01  # Learning rate for coordinate adjustments
+  angle_learning_rate: 0.2  # Learning rate for angle adjustments (not currently used in coordinate-based optimization)
+  finite_diff_epsilon: 0.01  # Epsilon for numerical gradient computation
+
+# Test and visualization mode
+test_mode: false  # If true, generate detailed visualizations and metrics
+
+# Visualization settings (only used when test_mode is true)
+visualization:
+  save_plots: true  # Save plots to files
+  show_plots: false  # Display plots interactively (set to false for headless environments)
+  output_dir: "outputs"  # Directory to save visualization outputs
+  plot_format: "png"  # Format for saved plots (png, pdf, svg)
+  dpi: 150  # Resolution for saved plots
+
+

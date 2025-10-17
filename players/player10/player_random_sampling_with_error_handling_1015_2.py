@@ -554,11 +554,16 @@ class Player10(Player):
                     )
 
                     if size_span_rounded == 0.00 and ratio_variance_rounded == 0.00:
-                        print(
-                            "🎯 PERFECT result found after mini_time! Returning immediately!"
-                        )
-                        return all_cuts
-
+                        current_elapsed_time = time.time() - start_time
+                        if current_elapsed_time > self.mini_time:
+                            print(
+                                "🎯 PERFECT result found after mini_time! Returning immediately!"
+                            )
+                            return all_cuts
+                        else:
+                            print(
+                                f"🎯 PERFECT result found before mini_time on attempt {attempt} (continuing to explore...)"
+                            )
                     # Continue exploring for non-perfect results
 
                     # Time-based computation ratio decay logic

@@ -19,12 +19,10 @@ PHRASE_THREE_STEP = 2.5
 # Error handling and retry constants
 SIZE_SPAN_THRESHOLD = 0.5  # Maximum allowed area span (same as final evaluation)
 RATIO_VARIANCE_THRESHOLD = 3  # Maximum allowed crust ratio variance
-MIN_COMPUTATION_RATIO = 1  # Minimum computation ratio before giving up
+MIN_COMPUTATION_RATIO = 0.5  # Minimum computation ratio before giving up
 DEFAULT_MAX_REPEAT_TIMES = 20  # Maximum number of retry attempts
 TIME_LIMIT_SECONDS = 60 * 4.5  # Maximum time limit before timeout
 DEFAULT_MINI_TIME = 60 * 1.5  # Time threshold for computation ratio decay
-SAMPLING_MODE_UNIFORM = "uniform_split"
-SAMPLING_MODE_RANDOM = "random_sampling"
 
 
 class Player10(Player):
@@ -37,7 +35,6 @@ class Player10(Player):
         num_of_processes: int = 8,
         max_repeat_times: int = DEFAULT_MAX_REPEAT_TIMES,
         mini_time: int = DEFAULT_MINI_TIME,
-        sampling_mode: str = SAMPLING_MODE_RANDOM,
     ) -> None:
         super().__init__(children, cake, cake_path)
         # Binary search tolerance: area within 0.5 cm² of target
@@ -55,8 +52,6 @@ class Player10(Player):
         self.max_repeat_times = max_repeat_times
         # Time threshold for computation ratio decay
         self.mini_time = mini_time
-        # Sampling mode for angle selection
-        self.sampling_mode = sampling_mode
 
     def find_line(self, position: float, piece: Polygon, angle: float):
         """Make a line at a given angle through a position that cuts the piece.
@@ -356,11 +351,7 @@ class Player10(Player):
         target_ratio = self.cake.interior_shape.area / self.cake.exterior_shape.area
         print(f"TARGET AREA: {target_area:.2f} cm²")
         print(f"TARGET CRUST RATIO: {target_ratio:.3f}")
-        print(
-            "Strategy: Greedy cutting with hybrid sampling (uniform first, then random)"
-        )
-        print("Sampling mode: uniform (first) → random (subsequent)")
-        print()
+        print("Strategy: Greedy cutting with random ratio+angle exploration\n")
 
         return self._get_cuts_with_retry(target_area, target_ratio)
 
@@ -443,7 +434,7 @@ class Player10(Player):
 
                 # Run the algorithm
                 all_cuts = self._greedy_ratio_angle_cutting(
-                    target_area, target_ratio, current_num_processes, attempt == 1
+                    target_area, target_ratio, current_num_processes
                 )
 
                 # Check if we got a complete result
@@ -526,16 +517,9 @@ class Player10(Player):
 
                     # Print result quality info
                     if self._is_result_good_enough(areas, ratios):
-                        current_elapsed_time = time.time() - start_time
-                        if current_elapsed_time > self.mini_time:
-                            print(
-                                f"✓ Good result found after mini_time ({current_elapsed_time:.1f}s > {self.mini_time}s), returning immediately!"
-                            )
-                            return all_cuts
-                        else:
-                            print(
-                                f"✓ Good result found before mini_time on attempt {attempt} (continuing to explore...)"
-                            )
+                        print(
+                            f"✓ Good result found on attempt {attempt} (continuing to explore...)"
+                        )
                     else:
                         print(f"✗ Result not good enough on attempt {attempt}")
 
@@ -555,14 +539,13 @@ class Player10(Player):
 
                     if size_span_rounded == 0.00 and ratio_variance_rounded == 0.00:
                         print(
-                            "🎯 PERFECT result found after mini_time! Returning immediately!"
+                            "🎯 PERFECT result found! Size span and ratio variance both 0.00, returning immediately!"
                         )
                         return all_cuts
 
-                    # Continue exploring for non-perfect results
-
                     # Time-based computation ratio decay logic
                     round_time = time.time() - round_start_time
+                    current_elapsed_time = time.time() - start_time
                     time_threshold = self.mini_time - current_elapsed_time
                     if current_elapsed_time > TIME_LIMIT_SECONDS:
                         print(
@@ -751,11 +734,7 @@ class Player10(Player):
         return complete_results[0][0]
 
     def _greedy_ratio_angle_cutting(
-        self,
-        target_area: float,
-        target_ratio: float,
-        num_processes: int = 8,
-        is_first_attempt: bool = True,
+        self, target_area: float, target_ratio: float, num_processes: int = 8
     ) -> list[tuple[Point, Point]]:
         """
         TRUE divide-and-conquer approach:
@@ -915,22 +894,11 @@ class Player10(Player):
                     f"  Phase 2: Trying {self.phrase_two_attempts} more angles with best ratio across {num_processes} processes..."
                 )
 
-                # Generate angles for phase 2 - use uniform for first attempt, then random
-                if is_first_attempt:
-                    # First attempt: use uniform distribution
-                    angle_step = 360.0 / self.phrase_two_attempts
-                    phase2_angles = [
-                        i * angle_step for i in range(self.phrase_two_attempts)
-                    ]
-                    print(
-                        f"    Using uniform sampling mode for first attempt ({angle_step:.1f}° steps)"
-                    )
-                else:
-                    # Subsequent attempts: use random sampling
-                    phase2_angles = [
-                        random.uniform(0, 360) for _ in range(self.phrase_two_attempts)
-                    ]
-                    print("    Using random sampling mode (0-360° range)")
+                # Generate angles for phase 2
+                angle_step = 360.0 / self.phrase_two_attempts
+                phase2_angles = [
+                    i * angle_step for i in range(self.phrase_two_attempts)
+                ]
 
                 # Process Phase 2 attempts concurrently
                 phase2_attempts_to_try = [

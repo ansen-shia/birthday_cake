@@ -83,7 +83,7 @@ class Player4(Player):
         print(
             f"Player 4: Search complete, took {self.end_time - self.start_time} seconds."
         )
-        while result is None and self.end_time - self.start_time < 60:
+        while result is None and self.end_time - self.start_time < 300:
             self.N_SWEEP_DIRECTIONS = self.N_SWEEP_DIRECTIONS * 2
             print(
                 f"Increasing sweep directions to {self.N_SWEEP_DIRECTIONS} and retrying..."
@@ -190,7 +190,11 @@ class Player4(Player):
 
         # For each angle, generate all cuts for that angle, then sort and filter
         candidate_cuts = []
-        for angle_deg in range(0, 180, 180 // self.N_SWEEP_DIRECTIONS):
+        cut_angles = []
+        degrees_per_cut = 180 / self.N_SWEEP_DIRECTIONS
+        for i in range(self.N_SWEEP_DIRECTIONS):
+            cut_angles.append(i * degrees_per_cut)
+        for angle_deg in cut_angles:
             angle_rad = math.radians(angle_deg)
 
             # Normal vector (direction we sweep along)
@@ -336,7 +340,11 @@ class Player4(Player):
             return []
 
         candidate_cuts = []
-        for angle_deg in range(0, 180, 180 // self.N_SWEEP_DIRECTIONS):
+        cut_angles = []
+        degrees_per_cut = 180 / self.N_SWEEP_DIRECTIONS
+        for i in range(self.N_SWEEP_DIRECTIONS):
+            cut_angles.append(i * degrees_per_cut)
+        for angle_deg in cut_angles:
             angle_rad = math.radians(angle_deg)
 
             # Normal vector (direction we sweep along)
