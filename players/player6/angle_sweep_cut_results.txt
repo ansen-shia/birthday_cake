@@ -1,0 +1,54 @@
+size span: 0.20cm^2
+stdev(ratio): 20.90
+size span: 3.68cm^2
+stdev(ratio): 4.44
+size span: 0.27cm^2
+stdev(ratio): 17.30
+size span: 0.33cm^2
+stdev(ratio): 26.97
+size span: 0.48cm^2
+stdev(ratio): 16.95
+size span: 1.22cm^2
+stdev(ratio): 18.49
+size span: 0.27cm^2
+stdev(ratio): 30.54
+size span: 0.21cm^2
+stdev(ratio): 20.64
+size span: 0.38cm^2
+stdev(ratio): 25.25
+size span: 0.15cm^2
+stdev(ratio): 17.92
+size span: 0.28cm^2
+stdev(ratio): 24.72
+size span: 0.33cm^2
+stdev(ratio): 25.33
+size span: 1.03cm^2
+stdev(ratio): 19.58
+size span: 0.33cm^2
+stdev(ratio): 15.11
+size span: 0.23cm^2
+stdev(ratio): 16.12
+size span: 0.24cm^2
+stdev(ratio): 16.94
+size span: 0.23cm^2
+stdev(ratio): 14.86
+size span: 0.22cm^2
+stdev(ratio): 16.49
+size span: 0.21cm^2
+stdev(ratio): 14.23
+size span: 0.24cm^2
+stdev(ratio): 16.94
+size span: 0.27cm^2
+stdev(ratio): 21.13
+size span: 0.29cm^2
+stdev(ratio): 18.74
+size span: 0.41cm^2
+stdev(ratio): 10.73
+size span: 0.27cm^2
+stdev(ratio): 24.96
+size span: 0.47cm^2
+stdev(ratio): 17.41
+size span: 0.30cm^2
+stdev(ratio): 15.28
+size span: 0.41cm^2
+stdev(ratio): 13.93
