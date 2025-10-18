@@ -489,6 +489,7 @@ class Player6(Player):
             self.cake.cut(best_slice.points[0], best_slice.points[1])
             large_result = self.divide_and_conquer(pieces[1], ceil(n_children / 2))
             small_result = self.divide_and_conquer(pieces[0], floor(n_children / 2))
+            print("made a cut")
             return result + small_result + large_result
 
     def _evaluate_angle_n(

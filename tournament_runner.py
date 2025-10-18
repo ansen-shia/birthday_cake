@@ -43,8 +43,10 @@ def cake_to_children(cake_path: str, piece: int):
 
 
 parameters = [
-    {"--import-cake": get_all_cakes()[0]},
-    {"--player": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]},
+    #{"--import-cake": get_all_cakes()[0]},
+    {"--import-cake": ["cakes/tournament/players/player4/hilbert_challenging.csv"]},
+    {"--player": ["6"]},
+    #{"--player": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]},
 ]
 
 
