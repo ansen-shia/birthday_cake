@@ -1,13 +1,30 @@
 from shapely.geometry import LineString, Point, Polygon
 import math
 import random
-from statistics import stdev
+import time
+from statistics import stdev, StatisticsError
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from players.player import Player
 from src.cake import Cake
 from shapely.ops import split
 
-NUMBER_ATTEMPS = 360
+COMPUTATION_RATIO = 8
+PHRASE_ONE_TOTAL_ATTEMPS = 90 * 9 * COMPUTATION_RATIO
+PHRASE_TWO_TOTAL_ATTEMPS = 360 * 9 * COMPUTATION_RATIO
+PHRASE_THREE_TOTAL_ATTEMPS = 60 * 9 * COMPUTATION_RATIO
+PHRASE_THREE_STEP = 2.5
+
+# Error handling and retry constants
+SIZE_SPAN_THRESHOLD = 0.5  # Maximum allowed area span (same as final evaluation)
+RATIO_VARIANCE_THRESHOLD = 3  # Maximum allowed crust ratio variance
+MIN_COMPUTATION_RATIO = 1  # Minimum computation ratio before giving up
+DEFAULT_MAX_REPEAT_TIMES = 20  # Maximum number of retry attempts
+TIME_LIMIT_SECONDS = 60 * 4.5  # Maximum time limit before timeout
+DEFAULT_MINI_TIME = 60 * 1.5  # Time threshold for computation ratio decay
+SAMPLING_MODE_UNIFORM = "uniform_split"
+SAMPLING_MODE_RANDOM = "random_sampling"
 
 
 class Player10(Player):
@@ -16,13 +33,30 @@ class Player10(Player):
         children: int,
         cake: Cake,
         cake_path: str | None,
-        num_angle_attempts: int = NUMBER_ATTEMPS,
+        phrase_three_attempts: int = 180,
+        num_of_processes: int = 8,
+        max_repeat_times: int = DEFAULT_MAX_REPEAT_TIMES,
+        mini_time: int = DEFAULT_MINI_TIME,
+        sampling_mode: str = SAMPLING_MODE_RANDOM,
     ) -> None:
         super().__init__(children, cake, cake_path)
         # Binary search tolerance: area within 0.5 cm² of target
         self.target_area_tolerance = 0.0001
-        # Number of different angles to try (more attempts = better for complex shapes)
-        self.num_angle_attempts = num_angle_attempts
+        # Number of different angles to try in phase 1 (more attempts = better for complex shapes)
+        self.phrase_one_attempts = PHRASE_ONE_TOTAL_ATTEMPS // (children - 1)
+        # Number of different angles to try in phase 2 (more attempts = better for complex shapes)
+        self.phrase_two_attempts = PHRASE_TWO_TOTAL_ATTEMPS // (children - 1)
+        # Number of different angles to try in phase 3 (fine-grained search)
+        self.phrase_three_attempts = PHRASE_THREE_TOTAL_ATTEMPS // (children - 1)
+        # Number of processes for concurrent search
+        # self.num_of_processes = min(num_of_processes, mp.cpu_count())
+        self.num_of_processes = num_of_processes
+        # Maximum number of retry attempts before giving up
+        self.max_repeat_times = max_repeat_times
+        # Time threshold for computation ratio decay
+        self.mini_time = mini_time
+        # Sampling mode for angle selection
+        self.sampling_mode = sampling_mode
 
     def find_line(self, position: float, piece: Polygon, angle: float):
         """Make a line at a given angle through a position that cuts the piece.
@@ -226,6 +260,94 @@ class Player10(Player):
 
         return best_pos
 
+    def _evaluate_attempt(self, args):
+        """Helper method for multiprocessing - evaluate a single attempt"""
+        (
+            split_children,
+            angle,
+            cutting_piece,
+            cutting_num_children,
+            target_area,
+            target_ratio,
+            phase,
+        ) = args
+
+        remaining_children = cutting_num_children - split_children
+        target_cut_area = target_area * split_children
+
+        # Find the cut position using binary search
+        position = self.binary_search(cutting_piece, target_cut_area, angle)
+        if position is None:
+            return None
+
+        cut_line = self.find_line(position, cutting_piece, angle)
+        cut_points = self.find_cuts(cut_line, cutting_piece)
+        if cut_points is None:
+            return None
+
+        from_p, to_p = cut_points
+
+        # Simulate the cut to get the two pieces
+        test_pieces = split(cutting_piece, cut_line)
+        if len(test_pieces.geoms) != 2:
+            return None
+
+        p1, p2 = test_pieces.geoms
+
+        # Determine which piece is for split_children
+        if abs(p1.area - target_cut_area) < abs(p2.area - target_cut_area):
+            small_piece, large_piece = p1, p2
+        else:
+            small_piece, large_piece = p2, p1
+
+        # Get crust ratios
+        ratio1 = self.cake.get_piece_ratio(small_piece)
+        ratio2 = self.cake.get_piece_ratio(large_piece)
+
+        # Score this cut
+        size_error = abs(small_piece.area - target_cut_area)
+        ratio_error = abs(ratio1 - target_ratio) + abs(ratio2 - target_ratio)
+        score = size_error * 3.0 + ratio_error * 1.0
+
+        return {
+            "score": score,
+            "cut_points": (from_p, to_p),
+            "small_piece": small_piece,
+            "large_piece": large_piece,
+            "ratio1": ratio1,
+            "ratio2": ratio2,
+            "angle": angle,
+            "split_children": split_children,
+            "remaining_children": remaining_children,
+            "size_error": size_error,
+            "ratio_error": ratio_error,
+        }
+
+    def _process_batch(
+        self, batch_args, cutting_piece, cutting_num_children, target_area, target_ratio
+    ):
+        """Process a batch of attempts and return the best result"""
+        best_result = None
+        best_score = float("inf")
+
+        for args in batch_args:
+            result = self._evaluate_attempt(
+                (
+                    args[0],
+                    args[1],
+                    cutting_piece,
+                    cutting_num_children,
+                    target_area,
+                    target_ratio,
+                    args[2],
+                )
+            )
+            if result and result["score"] < best_score:
+                best_score = result["score"]
+                best_result = result
+
+        return best_result
+
     def get_cuts(self) -> list[tuple[Point, Point]]:
         """Main cutting logic - greedy approach with random (ratio, angle) pairs"""
         print(f"__________Cutting for {self.children} children_______")
@@ -234,12 +356,406 @@ class Player10(Player):
         target_ratio = self.cake.interior_shape.area / self.cake.exterior_shape.area
         print(f"TARGET AREA: {target_area:.2f} cm²")
         print(f"TARGET CRUST RATIO: {target_ratio:.3f}")
-        print("Strategy: Greedy cutting with random ratio+angle exploration\n")
+        print(
+            "Strategy: Greedy cutting with hybrid sampling (uniform first, then random)"
+        )
+        print("Sampling mode: uniform (first) → random (subsequent)")
+        print()
 
-        return self._greedy_ratio_angle_cutting(target_area, target_ratio)
+        return self._get_cuts_with_retry(target_area, target_ratio)
+
+    def _is_result_good_enough(self, areas, ratios):
+        """Check if the final result meets the quality thresholds."""
+        if len(areas) < 2:
+            return False
+
+        size_span = max(areas) - min(areas)
+        if size_span > SIZE_SPAN_THRESHOLD:
+            return False
+
+        # Check ratio variance if we have multiple ratios
+        if len(ratios) > 1:
+            try:
+                ratio_variance = (
+                    stdev(ratios) * 100
+                )  # Scale to match evaluation display
+                if ratio_variance > RATIO_VARIANCE_THRESHOLD:
+                    return False
+            except (StatisticsError, ValueError, TypeError):
+                # If stdev fails, check if all ratios are within acceptable range (scaled)
+                ratio_range = (max(ratios) - min(ratios)) * 100
+                if ratio_range > RATIO_VARIANCE_THRESHOLD:
+                    return False
+
+        return True
+
+    def _get_cuts_with_retry(
+        self, target_area: float, target_ratio: float
+    ) -> list[tuple[Point, Point]]:
+        """Main cutting logic with retry mechanism and decaying computation ratio."""
+        start_time = time.time()
+        current_computation_ratio = COMPUTATION_RATIO
+        original_computation_ratio = COMPUTATION_RATIO
+        current_num_processes = self.num_of_processes
+        attempt = 0
+
+        # Track all results for final selection
+        all_results = []  # List of (cuts, areas, ratios, size_span, ratio_variance_scaled)
+
+        while attempt < self.max_repeat_times:
+            # Check for timeout before starting attempt
+            elapsed_time = time.time() - start_time
+            if elapsed_time > TIME_LIMIT_SECONDS:
+                print(f"⏰ TIMEOUT after {elapsed_time:.1f}s, selecting best result...")
+                return self._select_best_result(all_results) if all_results else []
+
+            attempt += 1
+            round_start_time = time.time()
+            print(f"\n{'=' * 60}")
+            print(
+                f"ATTEMPT {attempt}/{self.max_repeat_times} - Computation Ratio: {current_computation_ratio}, Processes: {current_num_processes}"
+            )
+            print(f"{'=' * 60}")
+
+            # Set different random seed for each attempt
+            random.seed(42 + attempt)
+
+            try:
+                # Update computation attempts based on current ratio (following original logic)
+                base_phrase_one = PHRASE_ONE_TOTAL_ATTEMPS // (self.children - 1)
+                base_phrase_two = PHRASE_TWO_TOTAL_ATTEMPS // (self.children - 1)
+                base_phrase_three = PHRASE_THREE_TOTAL_ATTEMPS // (self.children - 1)
+
+                self.phrase_one_attempts = int(
+                    base_phrase_one * current_computation_ratio / COMPUTATION_RATIO
+                )
+                self.phrase_two_attempts = int(
+                    base_phrase_two * current_computation_ratio / COMPUTATION_RATIO
+                )
+                self.phrase_three_attempts = int(
+                    base_phrase_three * current_computation_ratio / COMPUTATION_RATIO
+                )
+
+                # Ensure minimum attempts
+                self.phrase_one_attempts = max(10, self.phrase_one_attempts)
+                self.phrase_two_attempts = max(10, self.phrase_two_attempts)
+                self.phrase_three_attempts = max(5, self.phrase_three_attempts)
+
+                # Run the algorithm
+                all_cuts = self._greedy_ratio_angle_cutting(
+                    target_area, target_ratio, current_num_processes, attempt == 1
+                )
+
+                # Check if we got a complete result
+                if len(all_cuts) < self.children - 1:
+                    print(
+                        f"Incomplete result: got {len(all_cuts)} cuts, need {self.children - 1}"
+                    )
+                    # Still add incomplete results to the list for potential selection
+                    all_results.append((all_cuts, [], [], float("inf"), float("inf")))
+
+                    # Time-based computation ratio decay logic for incomplete results
+                    round_time = time.time() - round_start_time
+                    current_elapsed_time = time.time() - start_time
+                    time_threshold = self.mini_time - current_elapsed_time
+
+                    if current_elapsed_time > TIME_LIMIT_SECONDS:
+                        print(
+                            f"⏰ TIMEOUT after {current_elapsed_time:.1f}s during incomplete result, selecting best result..."
+                        )
+                        return (
+                            self._select_best_result(all_results)
+                            if all_results
+                            else all_cuts
+                        )
+                    elif (
+                        attempt >= self.max_repeat_times
+                        and current_computation_ratio <= MIN_COMPUTATION_RATIO
+                    ):
+                        print(
+                            "Max attempts reached and minimum computation ratio reached, selecting best result..."
+                        )
+                        return (
+                            self._select_best_result(all_results)
+                            if all_results
+                            else all_cuts
+                        )
+                    elif round_time >= time_threshold:
+                        # Current round took too long even with incomplete result, decay computation ratio for next round
+                        print(
+                            f"Incomplete round took {round_time:.1f}s >= threshold {time_threshold:.1f}s, decaying computation ratio"
+                        )
+                        old_ratio = current_computation_ratio
+                        current_computation_ratio = max(
+                            MIN_COMPUTATION_RATIO, current_computation_ratio / 2
+                        )
+                        # Decay processes only when computation ratio decays by factor of 4
+                        if (
+                            old_ratio >= original_computation_ratio / 2
+                            and current_computation_ratio
+                            < original_computation_ratio / 4
+                        ):
+                            current_num_processes = max(1, current_num_processes // 2)
+                    # Otherwise, keep same computation ratio for next round
+
+                    continue
+
+                # Evaluate the final result
+                try:
+                    cake_copy = self.cake.copy()
+                    for cut in all_cuts:
+                        cake_copy.cut(cut[0], cut[1])
+
+                    pieces = cake_copy.get_pieces()
+                    areas = [p.area for p in pieces]
+                    ratios = cake_copy.get_piece_ratios()
+
+                    # Calculate metrics
+                    size_span = max(areas) - min(areas) if areas else float("inf")
+                    ratio_variance_scaled = 0.0
+                    if len(ratios) > 1:
+                        try:
+                            ratio_variance_scaled = stdev(ratios) * 100
+                        except (StatisticsError, ValueError, TypeError):
+                            ratio_variance_scaled = (max(ratios) - min(ratios)) * 100
+
+                    # Store this result
+                    all_results.append(
+                        (all_cuts, areas, ratios, size_span, ratio_variance_scaled)
+                    )
+
+                    # Print result quality info
+                    if self._is_result_good_enough(areas, ratios):
+                        current_elapsed_time = time.time() - start_time
+                        if current_elapsed_time > self.mini_time:
+                            print(
+                                f"✓ Good result found after mini_time ({current_elapsed_time:.1f}s > {self.mini_time}s), returning immediately!"
+                            )
+                            return all_cuts
+                        else:
+                            print(
+                                f"✓ Good result found before mini_time on attempt {attempt} (continuing to explore...)"
+                            )
+                    else:
+                        print(f"✗ Result not good enough on attempt {attempt}")
+
+                    print(
+                        f"  Size span: {size_span:.2f} (threshold: {SIZE_SPAN_THRESHOLD})"
+                    )
+                    print(
+                        f"  Ratio variance: {ratio_variance_scaled:.2f} (threshold: {RATIO_VARIANCE_THRESHOLD})"
+                    )
+
+                    # Check if we found a perfect result (both metrics are 0.00)
+                    size_span_rounded = round(size_span, 2)
+                    ratio_variance_rounded = round(ratio_variance_scaled, 2)
+                    print(
+                        f"DEBUG: size_span={size_span:.6f} -> {size_span_rounded}, ratio_variance={ratio_variance_scaled:.6f} -> {ratio_variance_rounded}"
+                    )
+
+                    if size_span_rounded == 0.00 and ratio_variance_rounded == 0.00:
+                        print(
+                            "🎯 PERFECT result found after mini_time! Returning immediately!"
+                        )
+                        return all_cuts
+
+                    # Continue exploring for non-perfect results
+
+                    # Time-based computation ratio decay logic
+                    round_time = time.time() - round_start_time
+                    time_threshold = self.mini_time - current_elapsed_time
+                    if current_elapsed_time > TIME_LIMIT_SECONDS:
+                        print(
+                            f"⏰ TIMEOUT after {current_elapsed_time:.1f}s, selecting best result..."
+                        )
+                        return self._select_best_result(all_results)
+                    elif (
+                        attempt >= self.max_repeat_times
+                        and current_computation_ratio <= MIN_COMPUTATION_RATIO
+                    ):
+                        print(
+                            "Max attempts reached and minimum computation ratio reached, selecting best result..."
+                        )
+                        return self._select_best_result(all_results)
+                    elif round_time >= time_threshold:
+                        # Current round took too long, decay computation ratio for next round
+                        print(
+                            f"Round took {round_time:.1f}s >= threshold {time_threshold:.1f}s, decaying computation ratio"
+                        )
+                        old_ratio = current_computation_ratio
+                        current_computation_ratio = max(
+                            MIN_COMPUTATION_RATIO, current_computation_ratio / 2
+                        )
+                        # Decay processes only when computation ratio decays by factor of 4
+                        if (
+                            old_ratio >= original_computation_ratio / 2
+                            and current_computation_ratio
+                            < original_computation_ratio / 4
+                        ):
+                            current_num_processes = max(1, current_num_processes // 2)
+                    # Otherwise, keep same computation ratio for next round
+
+                    continue
+
+                # Evaluate the final result
+                except Exception as e:
+                    print(f"✗ Error evaluating result on attempt {attempt}: {e}")
+                    # Add a placeholder result for failed attempts
+                    all_results.append(([], [], [], float("inf"), float("inf")))
+
+                    # Time-based computation ratio decay logic for errors
+                    round_time = time.time() - round_start_time
+                    error_elapsed_time = time.time() - start_time
+                    time_threshold = self.mini_time - error_elapsed_time
+
+                    if error_elapsed_time > TIME_LIMIT_SECONDS:
+                        print(
+                            f"⏰ TIMEOUT after {error_elapsed_time:.1f}s during error, selecting best result..."
+                        )
+                        return (
+                            self._select_best_result(all_results) if all_results else []
+                        )
+                    elif (
+                        attempt >= self.max_repeat_times
+                        and current_computation_ratio <= MIN_COMPUTATION_RATIO
+                    ):
+                        print(
+                            "Max attempts reached and minimum computation ratio reached, selecting best result..."
+                        )
+                        return (
+                            self._select_best_result(all_results) if all_results else []
+                        )
+                    elif round_time >= time_threshold:
+                        # Current round took too long even with error, decay computation ratio for next round
+                        print(
+                            f"Round with error took {round_time:.1f}s >= threshold {time_threshold:.1f}s, decaying computation ratio"
+                        )
+                        old_ratio = current_computation_ratio
+                        current_computation_ratio = max(
+                            MIN_COMPUTATION_RATIO, current_computation_ratio / 2
+                        )
+                        # Decay processes only when computation ratio decays by factor of 4
+                        if (
+                            old_ratio >= original_computation_ratio / 2
+                            and current_computation_ratio
+                            < original_computation_ratio / 4
+                        ):
+                            current_num_processes = max(1, current_num_processes // 2)
+                    # Otherwise, keep same computation ratio for next round
+
+                    continue
+
+            except Exception as e:
+                print(f"✗ Error during attempt {attempt}: {e}")
+                # Add a placeholder result for failed attempts
+                all_results.append(([], [], [], float("inf"), float("inf")))
+
+                # Time-based computation ratio decay logic for algorithm errors
+                round_time = time.time() - round_start_time
+                algorithm_error_elapsed_time = time.time() - start_time
+                time_threshold = self.mini_time - algorithm_error_elapsed_time
+
+                if algorithm_error_elapsed_time > TIME_LIMIT_SECONDS:
+                    print(
+                        f"⏰ TIMEOUT after {algorithm_error_elapsed_time:.1f}s during algorithm error, selecting best result..."
+                    )
+                    return self._select_best_result(all_results) if all_results else []
+                elif (
+                    attempt >= self.max_repeat_times
+                    and current_computation_ratio <= MIN_COMPUTATION_RATIO
+                ):
+                    print(
+                        "Max attempts reached and minimum computation ratio reached, selecting best result..."
+                    )
+                    return self._select_best_result(all_results) if all_results else []
+                elif round_time >= time_threshold:
+                    # Current round took too long even with error, decay computation ratio for next round
+                    print(
+                        f"Round with error took {round_time:.1f}s >= threshold {time_threshold:.1f}s, decaying computation ratio"
+                    )
+                    old_ratio = current_computation_ratio
+                    current_computation_ratio = max(
+                        MIN_COMPUTATION_RATIO, current_computation_ratio / 2
+                    )
+                    # Decay processes only when computation ratio decays by factor of 4
+                    if (
+                        old_ratio >= original_computation_ratio / 2
+                        and current_computation_ratio < original_computation_ratio / 4
+                    ):
+                        current_num_processes = max(1, current_num_processes // 2)
+                # Otherwise, keep same computation ratio for next round
+
+                continue
+
+        # Final timeout check before selecting best result
+        final_elapsed_time = time.time() - start_time
+        if final_elapsed_time > TIME_LIMIT_SECONDS:
+            print(
+                f"⏰ TIMEOUT after {final_elapsed_time:.1f}s at end, selecting best result..."
+            )
+            return self._select_best_result(all_results) if all_results else []
+
+        print(
+            f"Max attempts ({self.max_repeat_times}) reached, selecting best result..."
+        )
+        return self._select_best_result(all_results) if all_results else []
+
+    def _select_best_result(self, all_results):
+        """Select the best result from all attempts based on quality criteria."""
+        if not all_results:
+            return []
+
+        # Filter out incomplete/failed results (empty cuts)
+        complete_results = [
+            result for result in all_results if result[0]
+        ]  # cuts is not empty
+
+        if not complete_results:
+            # If all results are incomplete, return the first one anyway
+            return all_results[0][0] if all_results else []
+
+        # Separate results into those with valid size span and those without
+        valid_size_span_results = []
+        invalid_size_span_results = []
+
+        for result in complete_results:
+            cuts, areas, ratios, size_span, ratio_variance_scaled = result
+            if size_span <= SIZE_SPAN_THRESHOLD:
+                valid_size_span_results.append(result)
+            else:
+                invalid_size_span_results.append(result)
+
+        # First priority: results with valid size span, choose minimum ratio variance
+        if valid_size_span_results:
+            best_result = min(
+                valid_size_span_results, key=lambda x: x[4]
+            )  # Sort by ratio_variance_scaled
+            cuts, areas, ratios, size_span, ratio_variance_scaled = best_result
+            print(
+                f"Selected best result: size_span={size_span:.2f}, ratio_variance={ratio_variance_scaled:.2f}"
+            )
+            return cuts
+
+        # Second priority: if no valid size span, use minimum size span (original scoring)
+        if invalid_size_span_results:
+            best_result = min(
+                invalid_size_span_results, key=lambda x: x[3]
+            )  # Sort by size_span
+            cuts, areas, ratios, size_span, ratio_variance_scaled = best_result
+            print(
+                f"No valid size span found, selected minimum size span: {size_span:.2f}"
+            )
+            return cuts
+
+        # This shouldn't happen, but fallback to first complete result
+        return complete_results[0][0]
 
     def _greedy_ratio_angle_cutting(
-        self, target_area: float, target_ratio: float
+        self,
+        target_area: float,
+        target_ratio: float,
+        num_processes: int = 8,
+        is_first_attempt: bool = True,
     ) -> list[tuple[Point, Point]]:
         """
         TRUE divide-and-conquer approach:
@@ -298,7 +814,6 @@ class Player10(Player):
             # Two-phase strategy:
             # Phase 1: Try all split ratios with cardinal angles + random sampling to find best ratio
             # Phase 2: Focus on best split ratio, only vary angles
-            num_attempts = self.num_angle_attempts
             cardinal_angles = [0, 90, 180, 270]
 
             best_cut = None
@@ -311,7 +826,7 @@ class Player10(Player):
             for split_children in range(min_split, max_split + 1):
                 split_ratio_scores[split_children] = float("inf")
 
-            # Build list of (split_ratio, angle) to try
+            # Build list of (split_ratio, angle) to try for Phase 1
             attempts_to_try = []
 
             # First: Try all split ratios with all cardinal angles
@@ -320,71 +835,71 @@ class Player10(Player):
                     attempts_to_try.append((split_children, angle, "phase1"))
 
             # Phase 1: Random sample all split ratios (first half)
-            phase1_attempts = num_attempts // 2
-            for _ in range(phase1_attempts):
+            for _ in range(self.phrase_one_attempts // 2):
                 split_children = random.randint(min_split, max_split)
                 angle = random.uniform(0, 180)
                 attempts_to_try.append((split_children, angle, "phase1"))
 
-            # Try phase 1 attempts
-            for split_children, angle, phase in attempts_to_try:
-                remaining_children = cutting_num_children - split_children
+            # Process Phase 1 attempts concurrently
+            print(
+                f"  Phase 1: Processing {len(attempts_to_try)} attempts across {num_processes} processes..."
+            )
 
-                # Calculate target area for this split
-                target_cut_area = target_area * split_children
+            # Split attempts into batches for each process
+            batch_size = max(1, len(attempts_to_try) // num_processes)
+            batches = [
+                attempts_to_try[i : i + batch_size]
+                for i in range(0, len(attempts_to_try), batch_size)
+            ]
 
-                # Find the cut position using binary search
-                position = self.binary_search(cutting_piece, target_cut_area, angle)
-                if position is None:
-                    continue
+            # Use ProcessPoolExecutor for concurrent processing
+            with ProcessPoolExecutor(
+                max_workers=max(1, num_processes // 4)
+            ) as executor:
+                # Submit all batches
+                future_to_batch = {
+                    executor.submit(
+                        self._process_batch,
+                        batch,
+                        cutting_piece,
+                        cutting_num_children,
+                        target_area,
+                        target_ratio,
+                    ): batch
+                    for batch in batches
+                }
 
-                cut_line = self.find_line(position, cutting_piece, angle)
-                cut_points = self.find_cuts(cut_line, cutting_piece)
-                if cut_points is None:
-                    continue
+                # Collect results as they complete
+                for future in as_completed(future_to_batch):
+                    try:
+                        result = future.result()
+                        if result:
+                            valid_attempts += 1
 
-                from_p, to_p = cut_points
+                            # Update best scores
+                            split_children = result["split_children"]
+                            if result["score"] < split_ratio_scores[split_children]:
+                                split_ratio_scores[split_children] = result["score"]
 
-                # Simulate the cut to get the two pieces
-                test_pieces = split(cutting_piece, cut_line)
-                if len(test_pieces.geoms) != 2:
-                    continue
+                            if result["score"] < best_score:
+                                best_score = result["score"]
+                                best_cut = (
+                                    result["cut_points"][0],
+                                    result["cut_points"][1],
+                                    result["small_piece"],
+                                    result["large_piece"],
+                                    result["ratio1"],
+                                    result["ratio2"],
+                                    result["angle"],
+                                )
+                                best_split_ratio = (
+                                    split_children,
+                                    result["remaining_children"],
+                                )
 
-                p1, p2 = test_pieces.geoms
-
-                # Determine which piece is for split_children
-                if abs(p1.area - target_cut_area) < abs(p2.area - target_cut_area):
-                    small_piece, large_piece = p1, p2
-                else:
-                    small_piece, large_piece = p2, p1
-
-                # Get crust ratios
-                ratio1 = self.cake.get_piece_ratio(small_piece)
-                ratio2 = self.cake.get_piece_ratio(large_piece)
-
-                valid_attempts += 1
-
-                # Score this cut
-                size_error = abs(small_piece.area - target_cut_area)
-                ratio_error = abs(ratio1 - target_ratio) + abs(ratio2 - target_ratio)
-                score = size_error * 3.0 + ratio_error * 1.0
-
-                # Track best score for this split ratio
-                if score < split_ratio_scores[split_children]:
-                    split_ratio_scores[split_children] = score
-
-                if score < best_score:
-                    best_score = score
-                    best_cut = (
-                        from_p,
-                        to_p,
-                        small_piece,
-                        large_piece,
-                        ratio1,
-                        ratio2,
-                        angle,
-                    )
-                    best_split_ratio = (split_children, remaining_children)
+                    except Exception as e:
+                        print(f"    Error in batch processing: {e}")
+                        continue
 
             # Phase 2: Use the best split ratio found, only vary angles
             if split_ratio_scores:
@@ -392,89 +907,183 @@ class Player10(Player):
                 best_ratio_from_phase1 = min(
                     split_ratio_scores.keys(), key=lambda k: split_ratio_scores[k]
                 )
-                phase2_attempts = 720
 
                 print(
                     f"  Phase 1 complete. Best split ratio: {best_ratio_from_phase1}/{cutting_num_children}"
                 )
                 print(
-                    f"  Phase 2: Trying {phase2_attempts} more angles with best ratio..."
+                    f"  Phase 2: Trying {self.phrase_two_attempts} more angles with best ratio across {num_processes} processes..."
                 )
 
-                remaining_children_phase2 = (
-                    cutting_num_children - best_ratio_from_phase1
+                # Generate angles for phase 2 - use uniform for first attempt, then random
+                if is_first_attempt:
+                    # First attempt: use uniform distribution
+                    angle_step = 360.0 / self.phrase_two_attempts
+                    phase2_angles = [
+                        i * angle_step for i in range(self.phrase_two_attempts)
+                    ]
+                    print(
+                        f"    Using uniform sampling mode for first attempt ({angle_step:.1f}° steps)"
+                    )
+                else:
+                    # Subsequent attempts: use random sampling
+                    phase2_angles = [
+                        random.uniform(0, 360) for _ in range(self.phrase_two_attempts)
+                    ]
+                    print("    Using random sampling mode (0-360° range)")
+
+                # Process Phase 2 attempts concurrently
+                phase2_attempts_to_try = [
+                    (best_ratio_from_phase1, angle, "phase2") for angle in phase2_angles
+                ]
+
+                # Split phase 2 attempts into batches for each process
+                batch_size = max(1, len(phase2_attempts_to_try) // num_processes)
+                batches = [
+                    phase2_attempts_to_try[i : i + batch_size]
+                    for i in range(0, len(phase2_attempts_to_try), batch_size)
+                ]
+
+                # Use ProcessPoolExecutor for concurrent processing
+                with ProcessPoolExecutor(max_workers=num_processes) as executor:
+                    # Submit all batches
+                    future_to_batch = {
+                        executor.submit(
+                            self._process_batch,
+                            batch,
+                            cutting_piece,
+                            cutting_num_children,
+                            target_area,
+                            target_ratio,
+                        ): batch
+                        for batch in batches
+                    }
+
+                    # Collect results as they complete
+                    for future in as_completed(future_to_batch):
+                        try:
+                            result = future.result()
+                            if result:
+                                valid_attempts += 1
+
+                                if result["score"] < best_score:
+                                    best_score = result["score"]
+                                    best_cut = (
+                                        result["cut_points"][0],
+                                        result["cut_points"][1],
+                                        result["small_piece"],
+                                        result["large_piece"],
+                                        result["ratio1"],
+                                        result["ratio2"],
+                                        result["angle"],
+                                    )
+                                    best_split_ratio = (
+                                        result["split_children"],
+                                        result["remaining_children"],
+                                    )
+
+                        except Exception as e:
+                            print(f"    Error in phase 2 batch processing: {e}")
+                            continue
+
+            # Phase 3: Fine-grained search around the best angle
+            if best_cut is not None:
+                best_angle = best_cut[6]  # Extract angle from best_cut tuple
+
+                print(
+                    f"  Phase 2 complete. Best angle: {best_angle:.1f}° with score {best_score:.3f}"
                 )
-                target_cut_area_phase2 = target_area * best_ratio_from_phase1
+                print(
+                    f"  Phase 3: Fine-grained search around {best_angle:.1f}° with {self.phrase_three_attempts} attempts..."
+                )
 
-                # In phase 2, try cardinal angles again with the best ratio, then random
-                angle_step = 360.0 / phase2_attempts
-                phase2_angles = [i * angle_step for i in range(phase2_attempts)]
+                # Calculate angle step from phase 2
+                angle_step_phase2 = 360.0 / self.phrase_two_attempts
 
-                for angle in phase2_angles:
-                    # Only vary angle, keep the best split ratio
-                    split_children = best_ratio_from_phase1
-                    remaining_children = remaining_children_phase2
+                # Define search range: best_angle +/- 2 * angle_step_phase2
+                search_range = PHRASE_THREE_STEP * angle_step_phase2
+                angle_min = max(0, best_angle - search_range)
+                angle_max = min(360, best_angle + search_range)
 
-                    # Find the cut position using binary search
-                    position = self.binary_search(
-                        cutting_piece, target_cut_area_phase2, angle
+                print(f"  Search range: {angle_min:.1f}° to {angle_max:.1f}°")
+
+                # Generate fine-grained angles uniformly in the search range
+                if self.phrase_three_attempts > 1:
+                    fine_angle_step = (angle_max - angle_min) / (
+                        self.phrase_three_attempts - 1
                     )
-                    if position is None:
-                        continue
+                    phase3_angles = [
+                        angle_min + i * fine_angle_step
+                        for i in range(self.phrase_three_attempts)
+                    ]
+                else:
+                    phase3_angles = [best_angle]
 
-                    cut_line = self.find_line(position, cutting_piece, angle)
-                    cut_points = self.find_cuts(cut_line, cutting_piece)
-                    if cut_points is None:
-                        continue
+                # Process Phase 3 attempts concurrently
+                phase3_attempts_to_try = [
+                    (best_ratio_from_phase1, angle, "phase3") for angle in phase3_angles
+                ]
 
-                    from_p, to_p = cut_points
+                # Split phase 3 attempts into batches for each process
+                batch_size = max(1, len(phase3_attempts_to_try) // num_processes)
+                batches = [
+                    phase3_attempts_to_try[i : i + batch_size]
+                    for i in range(0, len(phase3_attempts_to_try), batch_size)
+                ]
 
-                    # Simulate the cut to get the two pieces
-                    test_pieces = split(cutting_piece, cut_line)
-                    if len(test_pieces.geoms) != 2:
-                        continue
+                # Use ProcessPoolExecutor for concurrent processing
+                with ProcessPoolExecutor(
+                    max_workers=max(1, num_processes // 4)
+                ) as executor:
+                    # Submit all batches
+                    future_to_batch = {
+                        executor.submit(
+                            self._process_batch,
+                            batch,
+                            cutting_piece,
+                            cutting_num_children,
+                            target_area,
+                            target_ratio,
+                        ): batch
+                        for batch in batches
+                    }
 
-                    p1, p2 = test_pieces.geoms
+                    # Collect results as they complete
+                    for future in as_completed(future_to_batch):
+                        try:
+                            result = future.result()
+                            if result:
+                                valid_attempts += 1
 
-                    # Determine which piece is for split_children
-                    if abs(p1.area - target_cut_area_phase2) < abs(
-                        p2.area - target_cut_area_phase2
-                    ):
-                        small_piece, large_piece = p1, p2
-                    else:
-                        small_piece, large_piece = p2, p1
+                                if result["score"] < best_score:
+                                    best_score = result["score"]
+                                    best_cut = (
+                                        result["cut_points"][0],
+                                        result["cut_points"][1],
+                                        result["small_piece"],
+                                        result["large_piece"],
+                                        result["ratio1"],
+                                        result["ratio2"],
+                                        result["angle"],
+                                    )
+                                    best_split_ratio = (
+                                        result["split_children"],
+                                        result["remaining_children"],
+                                    )
 
-                    # Get crust ratios
-                    ratio1 = self.cake.get_piece_ratio(small_piece)
-                    ratio2 = self.cake.get_piece_ratio(large_piece)
+                        except Exception as e:
+                            print(f"    Error in phase 3 batch processing: {e}")
+                            continue
 
-                    valid_attempts += 1
-
-                    # Score this cut
-                    size_error = abs(small_piece.area - target_cut_area_phase2)
-                    ratio_error = abs(ratio1 - target_ratio) + abs(
-                        ratio2 - target_ratio
-                    )
-                    score = size_error * 3.0 + ratio_error * 1.0
-                    # print(f"    Angle {angle:.1f}°: score={score:.3f} (size_err={size_error:.2f}, ratio_err={ratio_error:.3f})")
-                    if score < best_score:
-                        best_score = score
-                        best_cut = (
-                            from_p,
-                            to_p,
-                            small_piece,
-                            large_piece,
-                            ratio1,
-                            ratio2,
-                            angle,
-                        )
-                        best_split_ratio = (split_children, remaining_children)
-
-            print(
-                f"    New best cut found at angle {angle:.1f}° with score {best_score:.3f}"
-            )
+                print(
+                    f"    Phase 3 complete. Final best angle: {best_cut[6]:.1f}° with score {best_score:.3f}"
+                )
+            else:
+                print(f"    Best cut found with score {best_score:.3f}")
             if best_cut is None:
-                print(f"  No valid cut found after {num_attempts} attempts!")
+                print(
+                    f"  No valid cut found after {len(attempts_to_try) + len(phase2_attempts_to_try)} attempts!"
+                )
                 # Put the piece back for now (shouldn't happen often)
                 pieces_queue.append((cutting_piece, cutting_num_children))
                 continue
@@ -526,8 +1135,8 @@ class Player10(Player):
 
         print(f"\nCrust ratios: {[f'{r:.3f}' for r in ratios]}")
         if len(ratios) > 1:
-            ratio_variance = stdev(ratios)
-        print(f"  Variance: {ratio_variance:.4f}")
+            ratio_variance = stdev(ratios) * 100
+        print(f"  Variance: {ratio_variance:.2f}")
         print(
             f"  Min: {min(ratios):.3f}, Max: {max(ratios):.3f}, Span: {max(ratios) - min(ratios):.3f}"
         )

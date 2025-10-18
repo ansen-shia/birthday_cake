@@ -1,3 +1,4 @@
+from sys import stderr
 import tkinter as tk
 from shapely import LineString
 import random
@@ -284,6 +285,16 @@ class Game:
         print(
             f"SCORE:\nsize span: {size_span:.2f}cm^2\nstdev(ratio): {ratio_score:.2f}"
         )
+
+
+        if c.TOURNAMENT:
+            self.args.import_cake = str(self.args.import_cake)
+            import_cake = self.args.import_cake[self.args.import_cake.index("cakes") :]
+            print(
+                f"{import_cake},{self.args.children},{self.args.player},{size_span:.4f},{ratio_score:.4f}",
+                file=stderr,
+                end="",
+            )
 
     def __init__(self, args: Args):
         random.seed(args.seed)

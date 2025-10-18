@@ -1,0 +1,25 @@
+# Test configuration with visualization enabled
+# Use this config to see detailed visualizations of the gradient descent process
+
+# Algorithm parameters
+number_attempts: 50  # Fewer attempts to create room for improvement
+
+# Gradient descent post-processing parameters
+gradient_descent:
+  n_iterations: 30  # Number of gradient descent iterations
+  position_learning_rate: 0.01  # Learning rate for coordinate adjustments
+  angle_learning_rate: 0.2  # Learning rate for angle adjustments
+  finite_diff_epsilon: 0.01  # Epsilon for numerical gradient computation
+
+# Test and visualization mode
+test_mode: true  # Enable detailed visualizations and metrics tracking
+
+# Visualization settings
+visualization:
+  save_plots: true  # Save plots to files
+  show_plots: false  # Display plots interactively (set to true for interactive viewing)
+  output_dir: "outputs"  # Directory to save visualization outputs
+  plot_format: "png"  # Format for saved plots (png, pdf, svg)
+  dpi: 150  # Resolution for saved plots
+
+

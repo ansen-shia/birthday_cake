@@ -1,483 +1,481 @@
-from __future__ import annotations
-from typing import List, Tuple, Optional
-import math
-
-from shapely.geometry import (
-    Point as ShyPoint,
-    Polygon,
-    MultiPolygon,
-    GeometryCollection,
-    LineString,
-    MultiLineString,
-)
-from shapely.ops import split as sh_split, nearest_points
-
+from dataclasses import dataclass
 from players.player import Player
 from src.cake import Cake
+from shapely.geometry import Polygon, LineString, Point
+from shapely import MultiLineString, intersection
+from shapely.ops import split
+from typing import cast, List
+from math import (
+    hypot,
+    pi,
+    cos,
+    sin,
+    isclose,
+    floor,
+    ceil,
+    sqrt,
+    isclose as math_isclose,
+)
+import numpy as np
+from joblib import Parallel, delayed
+import src.constants as c
 
-# ==================== Config ====================
-AREA_TOL = 0.5  # cm^2 tolerance for exterior area match
-CRUST_W = 1.0  # (not used now for scoring; left in case we revert)
-ANGLE_DEG_STEP = 6  # angle sweep granularity (smaller = slower, finer)
-BSEARCH_ITERS = 60
-SNAP_EPS = 1e-7
-MIN_SMALL_AREA_FLOOR = 1.0  # avoid engine "piece too small" errors
-
-
-# ==================== Helpers ====================
-def _as_points(coords) -> List[Tuple[float, float]]:
-    return [(float(x), float(y)) for x, y in coords]
-
-
-def _heal_polygon(P: Polygon) -> Polygon:
-    Q = P.buffer(0)
-    if isinstance(Q, Polygon):
-        return Q
-    if isinstance(Q, MultiPolygon) and Q.geoms:
-        return max(
-            (g for g in Q.geoms if isinstance(g, Polygon)),
-            key=lambda g: g.area,
-        )
-    return P
+# Golden ratio constant for search
+PHI = (1 + sqrt(5)) / 2
+RES_TUPLE = tuple[float, float, float]  # (Area_Score, Ratio_Score, Length_Score)
 
 
-def _long_line(theta: float, c: float, pad: float = 1e5) -> LineString:
-    nx, ny = math.cos(theta), math.sin(theta)
-    vx, vy = -ny, nx
-    mx, my = c * nx, c * ny
-    return LineString(
-        [(mx - pad * vx, my - pad * vy), (mx + pad * vx, my + pad * vy)],
-    )
+@dataclass
+class CutResult:
+    """Stores the resulting polygons and the cut endpoints."""
+
+    polygons: list[Polygon]
+    points: tuple[Point, Point]
 
 
-def _bounds_proj(P: Polygon, theta: float) -> Tuple[float, float]:
-    xmin, ymin, xmax, ymax = P.bounds
-    c, s = math.cos(theta), math.sin(theta)
-    vals = [
-        c * xmin + s * ymin,
-        c * xmin + s * ymax,
-        c * xmax + s * ymin,
-        c * xmax + s * ymax,
-    ]
-    return min(vals), max(vals)
+def extend_line_robust(line: LineString, extension_factor: float = 1.1) -> LineString:
+    """
+    Extends a LineString from its center point outward by an extension_factor
+    relative to its original length, ensuring it spans beyond the piece.
+    """
+    coords = list(line.coords)
+    if len(coords) != 2:
+        return line
+
+    (x1, y1), (x2, y2) = coords
+    dx, dy = (x2 - x1), (y2 - y1)
+    L = hypot(dx, dy)
+    if L == 0:
+        return line
+
+    # Unit vector
+    ux, uy = dx / L, dy / L
+
+    # New length
+    new_L = L * extension_factor
+
+    # Center point
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+    # New endpoints extending from the center
+    x1n, y1n = cx - new_L / 2 * ux, cy - new_L / 2 * uy
+    x2n, y2n = cx + new_L / 2 * ux, cy + new_L / 2 * uy
+
+    return LineString([(x1n, y1n), (x2n, y2n)])
 
 
-def _longest_chord(
-    P: Polygon,
-    theta: float,
-    c: float,
-) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
-    inter = P.intersection(_long_line(theta, c))
-    best = None
-    bestL = -1.0
-
-    def add(ls: LineString) -> None:
-        nonlocal best, bestL
-        if not isinstance(ls, LineString) or len(ls.coords) < 2:
-            return
-        L = ls.length
-        if L > bestL:
-            bestL = L
-            a, b = ls.coords[0], ls.coords[-1]
-            best = ((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
-
-    if isinstance(inter, LineString):
-        add(inter)
-    elif isinstance(inter, MultiLineString):
-        for g in inter.geoms:
-            add(g)
-    elif isinstance(inter, GeometryCollection):
-        for g in inter.geoms:
-            if isinstance(g, LineString):
-                add(g)
-            elif isinstance(g, MultiLineString):
-                for h in g.geoms:
-                    add(h)
-    return best
-
-
-def _split_by_chord(
-    P: Polygon, chord: Tuple[Tuple[float, float], Tuple[float, float]]
-) -> List[Polygon]:
-    (ax, ay), (bx, by) = chord
-
-    def _do(splitter) -> List[Polygon]:
-        try:
-            res = sh_split(P, splitter)
-        except Exception:
-            return []
-        return [
-            g
-            for g in getattr(res, "geoms", [])
-            if isinstance(g, Polygon) and g.area > 1e-10
-        ]
-
-    seg = LineString([(ax, ay), (bx, by)])
-    parts = _do(seg)
-    if len(parts) < 2:
-        dx, dy = bx - ax, by - ay
-        L = math.hypot(dx, dy)
-        if L > 0:
-            eps = SNAP_EPS
-            seg2 = LineString(
-                [(ax - eps * dx, ay - eps * dy), (bx + eps * dx, by + eps * dy)],
-            )
-            parts = _do(seg2)
-    return parts
-
-
-def _split_by_line(
-    P: Polygon,
-    theta: float,
-    c: float,
-) -> Tuple[
-    float,
-    float,
-    List[Polygon],
-    Optional[Tuple[Tuple[float, float], Tuple[float, float]]],
-]:
-    chord = _longest_chord(P, theta, c)
-    if chord is None:
-        return 0.0, P.area, [P], None
-    parts = _split_by_chord(P, chord)
-    if len(parts) < 2:
-        parts = [
-            g
-            for g in getattr(sh_split(P, _long_line(theta, c)), "geoms", [])
-            if isinstance(g, Polygon) and g.area > 1e-10
-        ]
-    if len(parts) < 2:
-        return 0.0, P.area, [P], chord
-    parts.sort(key=lambda g: g.area)
-    return parts[0].area, parts[-1].area, parts, chord
-
-
-def _snap_to_boundary(pt: ShyPoint, P: Polygon) -> ShyPoint:
-    _, on = nearest_points(pt, P.boundary)
-    return on
-
-
-def _bisection_offset_for_alpha(
-    P: Polygon, alpha: float, theta: float
-) -> Optional[float]:
-    if P.area <= 1e-12:
-        return None
-    lo, hi = _bounds_proj(P, theta)
-    target = alpha * P.area
-    for _ in range(BSEARCH_ITERS):
-        mid = 0.5 * (lo + hi)
-        n = (math.cos(theta), math.sin(theta))
-        _, _, parts, _ = _split_by_line(P, theta, mid)
-        left = 0.0
-        for g in parts:
-            ctr = g.representative_point()
-            if n[0] * ctr.x + n[1] * ctr.y - mid <= 0:
-                left += g.area
-        if abs(left - target) <= AREA_TOL:
-            return mid
-        if left < target:
-            lo = mid
-        else:
-            return None
-
-
-def _solve_alpha_line(
-    P: Polygon,
-    alpha: float,
-    angle_candidates: List[float],
-    cake_ratio_source: Cake,
-) -> Optional[Tuple[float, float, Tuple[Tuple[float, float], Tuple[float, float]]]]:
-    P = _heal_polygon(P)
-    best = None
-    for deg in angle_candidates:
-        theta = (deg % 180.0) * math.pi / 180.0
-        c = _bisection_offset_for_alpha(P, alpha, theta)
-        if c is None:
-            continue
-        aS, aL, parts, chord = _split_by_line(P, theta, c)
-        if chord is None or len(parts) < 2:
-            continue
-        parts_sorted = sorted(parts, key=lambda g: g.area, reverse=True)[:2]
-        big, small = parts_sorted[0], parts_sorted[1]
-        try:
-            r_big = cake_ratio_source.get_piece_ratio(big)
-            r_small = cake_ratio_source.get_piece_ratio(small)
-        except Exception:
-            r_big = 0.0
-            r_small = 0.0
-        score = abs(r_big - r_small)
-        if best is None or (
-            score < best[0]
-            or (
-                math.isclose(score, best[0])
-                and abs(aS - alpha * P.area) < abs(best[3] - alpha * P.area)
-            )
-        ):
-            best = (score, theta, c, aS, chord)
-    if best is None:
-        return None
-    _, theta, c, _, chord = best
-    return theta, c, chord
-
-
-def _angle_grid(step_deg: int = ANGLE_DEG_STEP) -> List[float]:
-    return [float(d) for d in range(0, 180, step_deg)]
-
-
-def _small_area(P: Polygon, theta: float, c: float) -> float:
-    aS, _, _, _ = _split_by_line(P, theta, c)
-    return aS
-
-
-def _nudge_c_to_avoid_sliver(
-    P: Polygon, theta: float, c: float, min_small_area: float
-) -> float:
-    xmin, ymin, xmax, ymax = P.bounds
-    step = 0.01 * ((xmax - xmin) + (ymax - ymin))
-    best_c = c
-    best_a = _small_area(P, theta, c)
-    if best_a >= min_small_area:
-        return c
-    for k in range(1, 21):
-        for sign in (+1, -1):
-            c2 = c + sign * k * step
-            a2 = _small_area(P, theta, c2)
-            if a2 > best_a:
-                best_a = a2
-                best_c = c2
-                if best_a >= min_small_area:
-                    return best_c
-    return best_c
-
-
-def _apply_validated_cut(
-    cake_sim: Cake,
-    P: Polygon,
-    theta: float,
-    c: float,
-    chord_hint: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
-    min_small_area: float = MIN_SMALL_AREA_FLOOR,
-) -> Optional[Tuple[Polygon, Polygon, Tuple[ShyPoint, ShyPoint]]]:
-    c_adj = _nudge_c_to_avoid_sliver(P, theta, c, min_small_area)
-    chord = chord_hint or _longest_chord(P, theta, c_adj)
-    if chord is None:
-        return None
-    (ax, ay), (bx, by) = chord
-    pa = _snap_to_boundary(ShyPoint(ax, ay), P)
-    pb = _snap_to_boundary(ShyPoint(bx, by), P)
-
-    ok, _ = cake_sim.cut_is_valid(pa, pb)
-    if not ok:
-        xmin, ymin, xmax, ymax = P.bounds
-        step = 0.01 * ((xmax - xmin) + (ymax - ymin))
-        for mul in (1, -1, 2, -2):
-            c_try = c_adj + mul * step
-            chord2 = _longest_chord(P, theta, c_try)
-            if chord2 is None:
-                continue
-            (ax2, ay2), (bx2, by2) = chord2
-            pa2 = _snap_to_boundary(ShyPoint(ax2, ay2), P)
-            pb2 = _snap_to_boundary(ShyPoint(bx2, by2), P)
-            ok2, _ = cake_sim.cut_is_valid(pa2, pb2)
-            if ok2:
-                pa = pa2
-                pb = pb2
-                c_adj = c_try
-                chord = chord2
-                break
-        else:
-            return None
-
-    try:
-        cake_sim.cut(pa, pb)
-    except Exception:
-        return None
-
-    parts = _split_by_chord(P, ((pa.x, pa.y), (pb.x, pb.y)))
-    if len(parts) < 2:
-        parts = [
-            g
-            for g in getattr(
-                sh_split(P, LineString([(pa.x, pa.y), (pb.x, pb.y)])),
-                "geoms",
-                [],
-            )
-            if isinstance(g, Polygon) and g.area > 1e-10
-        ]
-    if len(parts) < 2:
-        return None
-
-    parts.sort(key=lambda g: g.area, reverse=True)
-    return parts[0], parts[1], (pa, pb)
-
-
-# ==================== Planner ====================
-def _plan_piece(
-    P: Polygon,
-    m: int,
-    total_area_unit: float,
-    cuts_out: List[Tuple[ShyPoint, ShyPoint]],
-    cake_sim: Cake,
-) -> None:
-    P = _heal_polygon(P)
-    if m <= 1 or P.area <= 1e-9:
-        return
-
-    angles = _angle_grid()
-
-    if m % 4 == 0:
-        sol = _solve_alpha_line(P, 0.5, angles, cake_sim)
-        if sol is None:
-            return
-        theta, c, chord = sol
-        applied = _apply_validated_cut(cake_sim, P, theta, c, chord_hint=chord)
-        if applied is None:
-            return
-        L, S, (pa, pb) = applied
-        cuts_out.append((pa, pb))
-        _plan_piece(L, m // 2, total_area_unit, cuts_out, cake_sim)
-        _plan_piece(S, m // 2, total_area_unit, cuts_out, cake_sim)
-        return
-
-    if m % 4 == 2:
-        k = (m - 2) // 4
-        alpha = (2.0 * k) / (4.0 * k + 2.0) if m >= 2 else 0.5
-        sol = _solve_alpha_line(P, alpha, angles, cake_sim)
-        if sol is not None:
-            theta, c, chord = sol
-            applied = _apply_validated_cut(cake_sim, P, theta, c, chord_hint=chord)
-            if applied is not None:
-                L, S, (pa, pb) = applied
-                cuts_out.append((pa, pb))
-                m1 = int(round(alpha * m))
-                m1 = max(1, min(m - 1, m1))
-                m2 = m - m1
-                if L.area >= S.area:
-                    _plan_piece(L, m2, total_area_unit, cuts_out, cake_sim)
-                    _plan_piece(S, m1, total_area_unit, cuts_out, cake_sim)
-                else:
-                    _plan_piece(L, m1, total_area_unit, cuts_out, cake_sim)
-                    _plan_piece(S, m2, total_area_unit, cuts_out, cake_sim)
-                return
-
-        # Fallback
-        sol2 = _solve_alpha_line(P, 0.5, angles, cake_sim)
-        if sol2 is None:
-            return
-        theta0, c0, chord0 = sol2
-        applied0 = _apply_validated_cut(cake_sim, P, theta0, c0, chord_hint=chord0)
-        if applied0 is None:
-            return
-        H1, H2, (p0a, p0b) = applied0
-        cuts_out.append((p0a, p0b))
-
-        halves = [H1, H2]
-        remainders: List[Polygon] = []
-
-        for H in halves:
-            if H.is_empty:
-                continue
-            target_alpha_half = total_area_unit / max(H.area, 1e-12)
-            target_alpha_half = max(0.0, min(1.0, target_alpha_half))
-            local_angles = [
-                ((theta0 * 180 / math.pi + d) % 180.0) for d in (-12, -6, 0, 6, 12)
-            ]
-            solH = _solve_alpha_line(H, target_alpha_half, local_angles, cake_sim)
-            if solH is None:
-                remainders.append(H)
-                continue
-            th, cH, chordH = solH
-            appliedH = _apply_validated_cut(
-                cake_sim,
-                H,
-                th,
-                cH,
-                chord_hint=chordH,
-                min_small_area=MIN_SMALL_AREA_FLOOR,
-            )
-            if appliedH is None:
-                remainders.append(H)
-                continue
-            Lh, Sh, (pha, phb) = appliedH
-            cuts_out.append((pha, phb))
-            small, large = (Sh, Lh) if Sh.area <= Lh.area else (Lh, Sh)
-            remainders.append(large)
-
-        rem = m - 2
-        if rem <= 0 or not remainders:
-            return
-        totalA = sum(g.area for g in remainders)
-        counts = [int(round(rem * (g.area / totalA))) for g in remainders]
-        diff = rem - sum(counts)
-        order = sorted(
-            range(len(remainders)),
-            key=lambda i: remainders[i].area,
-            reverse=True,
-        )
-        idx = 0
-        while diff != 0 and order:
-            j = order[idx % len(order)]
-            if diff > 0:
-                counts[j] += 1
-                diff -= 1
-            else:
-                if counts[j] > 0:
-                    counts[j] -= 1
-                    diff += 1
-            idx += 1
-
-        for g, cnt in zip(remainders, counts):
-            if cnt > 0:
-                _plan_piece(g, cnt, total_area_unit, cuts_out, cake_sim)
-        return
-
-    sol = _solve_alpha_line(P, 0.5, angles, cake_sim)
-    if sol is None:
-        return
-    th, cc, chord = sol
-    applied = _apply_validated_cut(cake_sim, P, th, cc, chord_hint=chord)
-    if applied is None:
-        return
-    L, S, (pa, pb) = applied
-    cuts_out.append((pa, pb))
-    m1 = m // 2
-    m2 = m - m1
-    _plan_piece(L, m1, total_area_unit, cuts_out, cake_sim)
-    _plan_piece(S, m2, total_area_unit, cuts_out, cake_sim)
-
-
-# ==================== Player ====================
 class Player1(Player):
-    def __init__(self, children: int, cake: Cake, cake_path: str | None = None) -> None:
+    def __init__(self, children: int, cake: Cake, cake_path: str | None) -> None:
         super().__init__(children, cake, cake_path)
+        self.target_area = self.cake.get_area() / self.children
+        # ratio target isn't directly used in the metric selection now, but kept for scoring ties
+        self.target_ratio = self.cake.get_piece_ratio(self.cake.exterior_shape)
 
-    def _extract_polygon(self) -> Polygon:
-        ext = getattr(self.cake, "exterior_shape", None)
-        if isinstance(ext, Polygon):
-            return _heal_polygon(ext)
-        if hasattr(self.cake, "get_boundary_points") and callable(
-            self.cake.get_boundary_points,
-        ):
-            pts = _as_points(self.cake.get_boundary_points())
-            if len(pts) >= 3:
-                if pts[0] == pts[-1]:
-                    pts = pts[:-1]
-                return _heal_polygon(Polygon(pts))
-        raise ValueError("Player1: cannot extract exterior polygon")
+        # “threshold” you asked for — used as a flat valley on area error in cut scoring
+        self.flat_tol: float = 0.0
 
-    def get_cuts(self) -> List[Tuple[ShyPoint, ShyPoint]]:
-        P0 = self._extract_polygon()
-        if not isinstance(P0, Polygon) or P0.area <= 1e-9:
+    # --- Utility Methods ---
+
+    def _get_piece_boundary_touchers(
+        self, p: Point, pieces: list[Polygon]
+    ) -> list[Polygon]:
+        """Returns list of polygons whose boundary is near the specified point."""
+        return [piece for piece in pieces if p.distance(piece.boundary) <= c.TOL]
+
+    def _is_cut_fully_contained(self, cut: LineString, polygon: Polygon) -> bool:
+        """Checks if the cut is entirely within the polygon boundary plus tolerance."""
+        return cut.difference(polygon.buffer(c.TOL * 2)).is_empty
+
+    def _get_single_cuttable_piece(self, p1: Point, p2: Point, polygons: list[Polygon]):
+        """
+        Identifies the single polygon that is meant to be cut.
+        Returns: tuple[Polygon, LineString, str] on success, or tuple[None, None, str] on failure.
+        """
+        pieces_at_p1 = self._get_piece_boundary_touchers(p1, polygons)
+        pieces_at_p2 = self._get_piece_boundary_touchers(p2, polygons)
+
+        contenders = set(pieces_at_p1).intersection(set(pieces_at_p2))
+
+        if len(contenders) != 1:
+            reason = f"Cut touches {len(contenders)} pieces, must be exactly 1."
+            return None, None, reason
+
+        piece = list(contenders)[0]
+
+        # Snap points to piece boundary for the actual cut line
+        bound = piece.boundary
+        a = bound.interpolate(bound.project(p1))
+        b = bound.interpolate(bound.project(p2))
+
+        # Line extended from snapped points
+        test_line = extend_line_robust(LineString([a, b]))
+
+        if piece.touches(test_line):
+            return None, None, "Extended cut lies on piece boundary."
+
+        if not test_line.crosses(piece):
+            return None, None, "Extended line does not cut through piece."
+
+        cut_pieces = split(piece, test_line)
+        if len(cut_pieces.geoms) != 2:
+            reason = f"Cut results in {len(cut_pieces.geoms)} pieces, not 2."
+            return None, None, reason
+
+        # Check for minimum area constraint
+        if not all(p.area >= c.MIN_PIECE_AREA for p in cut_pieces.geoms):
+            return None, None, "Cut results in a piece that's too small."
+
+        # Success case
+        return piece, LineString([a, b]), ""
+
+    def _validate_and_make_cut(
+        self, from_p: Point, to_p: Point, piece: Polygon
+    ) -> CutResult | None:
+        """Validates a cut and executes it virtually if valid."""
+        line_segment = LineString([from_p, to_p])
+        if not self._is_cut_fully_contained(line_segment, piece):
+            return None
+
+        target_piece, snapped_line, reason = self._get_single_cuttable_piece(
+            from_p, to_p, [piece]
+        )
+        if target_piece is None:
+            return None
+
+        # Re-extend the snapped line for the split operation
+        extended_snapped_line = extend_line_robust(snapped_line)
+        split_piece = split(target_piece, extended_snapped_line)
+        split_pieces: list[Polygon] = [
+            cast(Polygon, geom) for geom in split_piece.geoms
+        ]
+
+        # Use the snapped points for the final output
+        a, b = Point(snapped_line.coords[0]), Point(snapped_line.coords[1])
+        return CutResult(polygons=split_pieces, points=(a, b))
+
+    def _get_piece_ratio(self, piece: Polygon) -> float:
+        """Use engine API so ratio matches the simulator/game.py."""
+        try:
+            return float(self.cake.get_piece_ratio(piece))
+        except Exception:
+            # very rare fallback
+            if piece.intersects(self.cake.interior_shape):
+                inter = piece.intersection(self.cake.interior_shape)
+                return (
+                    inter.area / piece.area
+                    if not inter.is_empty and piece.area > 0
+                    else 0.0
+                )
+            return 0.0
+
+    def _score_cut_by_division(
+        self, cut: CutResult, n_children_to_divide: int
+    ) -> RES_TUPLE:
+        """
+        Score a candidate cut for a given piece split.
+        Primary = area closeness to each side's slice budget (with flat_tol),
+        Secondary = ratio proximity,
+        Tertiary = prefer shorter chord.
+        """
+        if cut is None or len(cut.polygons) != 2:
+            return (float("inf"), float("inf"), float("inf"))
+
+        p1, p2 = cut.polygons
+        areas = [p1.area, p2.area]
+        ratios = [self._get_piece_ratio(p1), self._get_piece_ratio(p2)]
+
+        # small/large
+        small_idx, large_idx = (0, 1) if areas[0] <= areas[1] else (1, 0)
+        small_area, large_area = areas[small_idx], areas[large_idx]
+
+        # expected children per side
+        n_small = floor(n_children_to_divide / 2)
+        n_large = ceil(n_children_to_divide / 2)
+
+        # target *total* area for each side (not per-child)
+        target_small = n_small * self.target_area
+        target_large = n_large * self.target_area
+
+        # area error per side
+        area_err_small = abs(small_area - target_small) if n_small > 0 else 0.0
+        area_err_large = abs(large_area - target_large) if n_large > 0 else 0.0
+        area_score = max(area_err_small, area_err_large)
+
+        # apply your threshold (=flat valley): anything within tol is "equally fine"
+        if self.flat_tol > 0.0 and area_score < self.flat_tol:
+            area_score = 0.0
+
+        # ratio closeness (to global target ratio)
+        ratio_score = max(abs(r - self.target_ratio) for r in ratios)
+
+        # prefer shorter chord when ties
+        chord_len = LineString(cut.points).length
+        length_score = chord_len if chord_len > 0 else float("inf")
+
+        return (area_score, ratio_score, length_score)
+
+    # --- Search machinery ---
+
+    def _generate_line_from_angle_pos(
+        self, piece: Polygon, angle_rad: float, position_frac: float
+    ) -> LineString:
+        """Long line across the piece's bbox at angle angle_rad and sweep position."""
+        min_x, min_y, max_x, max_y = piece.bounds
+
+        # Near-vertical
+        if isclose(cos(angle_rad), 0.0, abs_tol=0.01):
+            x_const = min_x + position_frac * (max_x - min_x)
+            return LineString([(x_const, min_y), (x_const, max_y)])
+
+        width = max_x - min_x
+        height = max_y - min_y
+
+        ref_x = min_x + position_frac * width
+        ref_y = min_y + position_frac * height
+
+        dx, dy = cos(angle_rad), sin(angle_rad)
+        max_distance = hypot(width, height) * 2
+
+        x1 = ref_x - max_distance * dx
+        y1 = ref_y - max_distance * dy
+        x2 = ref_x + max_distance * dx
+        y2 = ref_y + max_distance * dy
+
+        return LineString([(x1, y1), (x2, y2)])
+
+    def _try_cut_at_position(
+        self, position_frac: float, piece: Polygon, angle_rad: float
+    ) -> list[CutResult] | None:
+        """Attempt to make a cut at the given angle and position."""
+        line = self._generate_line_from_angle_pos(piece, angle_rad, position_frac)
+        intersections = intersection(line, piece)
+        if intersections.is_empty:
+            return None
+
+        results: List[CutResult] = []
+        geometries = (
+            intersections.geoms
+            if isinstance(intersections, MultiLineString)
+            else [intersections]
+        )
+        for geom in geometries:
+            if isinstance(geom, LineString):
+                cut_res = self._validate_and_make_cut(
+                    Point(geom.coords[0]), Point(geom.coords[-1]), piece
+                )
+                if cut_res:
+                    results.append(cut_res)
+        return results if results else None
+
+    def _golden_section_search_cut(
+        self,
+        piece: Polygon,
+        n_children: int,
+        angle_rad: float,
+        epsilon: float = 1e-4,
+        max_iterations: int = 80,
+    ) -> tuple[CutResult | None, RES_TUPLE]:
+        """Golden Section Search for the optimal cut position (0.01 to 0.99) at a fixed angle."""
+
+        def evaluate_position(pos: float) -> tuple[CutResult | None, RES_TUPLE]:
+            cuts = self._try_cut_at_position(pos, piece, angle_rad)
+            best_cut: CutResult | None = None
+            best_score: RES_TUPLE = (float("inf"), float("inf"), float("inf"))
+            if cuts:
+                for cut in cuts:
+                    score = self._score_cut_by_division(cut, n_children)
+                    if score < best_score:
+                        best_score, best_cut = score, cut
+            return best_cut, best_score
+
+        a, b = 0.01, 0.99
+        c_val = b - (b - a) / PHI
+        d_val = a + (b - a) / PHI
+
+        cut_c, score_c = evaluate_position(c_val)
+        cut_d, score_d = evaluate_position(d_val)
+        best_cut, best_score = min(
+            [(cut_c, score_c), (cut_d, score_d)], key=lambda x: x[1]
+        )
+
+        for _ in range(max_iterations):
+            if abs(b - a) < epsilon:
+                break
+
+            if score_c < score_d:
+                b = d_val
+                d_val = c_val
+                c_val = b - (b - a) / PHI
+                cut_d, score_d = cut_c, score_c
+                cut_c, score_c = evaluate_position(c_val)
+            else:
+                a = c_val
+                c_val = d_val
+                d_val = a + (b - a) / PHI
+                cut_c, score_c = cut_d, score_d
+                cut_d, score_d = evaluate_position(d_val)
+
+            current_best = min([(cut_c, score_c), (cut_d, score_d)], key=lambda x: x[1])
+            if current_best[1] < best_score:
+                best_cut, best_score = current_best
+
+        return best_cut, best_score
+
+    def _evaluate_angle_gss(
+        self, angle_rad: float, piece: Polygon, n_children: int
+    ) -> tuple[CutResult | None, RES_TUPLE]:
+        """Helper to evaluate a single angle using Golden Section Search for parallel processing."""
+        return self._golden_section_search_cut(piece, n_children, angle_rad)
+
+    # --- Core planner on a provided Cake (clone or real) ---
+
+    def _plan_on_cake(self, cake_obj: Cake) -> list[tuple[Point, Point]]:
+        """Run divide-and-conquer on a specific Cake object and return the cut list."""
+        if not cake_obj.exterior_pieces:
             return []
-        n = int(self.children)
-        if n <= 1:
+        return self._divide_and_conquer_with_cake(
+            cake_obj.exterior_pieces[0], self.children, cake_obj
+        )
+
+    def _divide_and_conquer_with_cake(
+        self, piece: Polygon, n_children_to_divide: int, cake_obj: Cake
+    ) -> list[tuple[Point, Point]]:
+        if n_children_to_divide <= 1:
             return []
 
-        cuts: List[Tuple[ShyPoint, ShyPoint]] = []
-        unit = P0.area / n
-        cake_sim = self.cake.copy()
-        _plan_piece(P0, n, unit, cuts, cake_sim)
+        # Coarse Angle Search: 9 angles from 0 to 180 degrees (0 to pi radians)
+        angles_coarse = np.linspace(0, pi, 9)
 
-        if len(cuts) > n - 1:
-            cuts = cuts[: n - 1]
-        return cuts
+        best_overall_cut: CutResult | None = None
+        best_overall_score: RES_TUPLE = (float("inf"), float("inf"), float("inf"))
+
+        # Parallel run of Golden Section Search on all coarse angles
+        results_coarse: List[tuple[CutResult | None, RES_TUPLE]] = Parallel(n_jobs=-1)(
+            delayed(self._evaluate_angle_gss)(angle, piece, n_children_to_divide)
+            for angle in angles_coarse
+        )
+
+        for cut, score in results_coarse:
+            # Must ensure a valid cut that actually split the piece into two
+            if (
+                cut is not None
+                and score < best_overall_score
+                and len(cut.polygons) == 2
+            ):
+                best_overall_score, best_overall_cut = score, cut
+
+        if not best_overall_cut:
+            return []
+
+        # Execute the cut on this cake
+        cut_points = best_overall_cut.points
+        cake_obj.cut(cut_points[0], cut_points[1])
+
+        # Sort new pieces by area
+        p1, p2 = sorted(best_overall_cut.polygons, key=lambda p: p.area)
+
+        # Distribute remaining children: small piece gets floor(N/2), large piece gets ceil(N/2)
+        n_small = floor(n_children_to_divide / 2)
+        n_large = ceil(n_children_to_divide / 2)
+
+        # Recurse
+        small_result = self._divide_and_conquer_with_cake(p1, n_small, cake_obj)
+        large_result = self._divide_and_conquer_with_cake(p2, n_large, cake_obj)
+
+        # The final result is the current cut + recursive cuts
+        return [cut_points] + small_result + large_result
+
+    # --- Your requested sweep over threshold values (0.001 → 0.245 step 0.002) ---
+
+    def get_cuts(self) -> list[tuple[Point, Point]]:
+        """
+        Sweep threshold (flat_tol) from 0.001 to 0.245 (step=0.002).
+        For each threshold:
+          - run full cut pipeline on a cloned cake,
+          - compute size_span = max(area) - min(area),
+          - compute ratio_score = std dev of per-slice ratios via engine API,
+          - print metrics,
+        Pick the threshold minimizing (size_span + ratio_score),
+        tie-break with smaller ratio_score, then smaller size_span.
+        Replay the best threshold on the real cake and return its cuts.
+        """
+        thresholds = [round(x, 3) for x in np.arange(0.001, 0.245 + 1e-9, 0.01)]
+
+        best_thresh = None
+        best_metric_sum = float("inf")
+        best_ratio_score = float("inf")
+        best_size_span = float("inf")
+        best_cuts: list[tuple[Point, Point]] = []
+
+        print(
+            "\n[Player1] threshold sweep (flat_tol): choose MIN (size_span + ratio_score)"
+        )
+        print("  thr     count   size_span     ratio_score")
+
+        for thr in thresholds:
+            cake_sim = self.cake.copy()
+            self.flat_tol = thr
+
+            # run full plan on the clone
+            cuts_try = self._plan_on_cake(cake_sim)
+
+            # collect final pieces & metrics
+            try:
+                final_pieces = getattr(cake_sim, "exterior_pieces", [])
+                areas = [p.area for p in final_pieces] if final_pieces else []
+                count = len(areas)
+                if count != self.children or count == 0:
+                    print(
+                        f"  {thr:0.3f}   {count:5d}   {'nan':>9}   {'nan':>12}  (skipped)"
+                    )
+                    continue
+
+                size_span = max(areas) - min(areas)
+                ratios = [cake_sim.get_piece_ratio(p) for p in final_pieces]
+                ratio_score = float(np.std(ratios)) if ratios else float("inf")
+                metric_sum = size_span + ratio_score
+
+                print(
+                    f"  {thr:0.3f}   {count:5d}   {size_span:9.5f}   {ratio_score:12.5f}"
+                )
+
+            except Exception:
+                print(f"  {thr:0.3f}   ERROR computing metrics")
+                continue
+
+            # select min(size_span + ratio_score), then min ratio_score, then min size_span
+            better = False
+            if metric_sum < best_metric_sum:
+                better = True
+            elif math_isclose(metric_sum, best_metric_sum):
+                if (ratio_score < best_ratio_score) or (
+                    math_isclose(ratio_score, best_ratio_score)
+                    and size_span < best_size_span
+                ):
+                    better = True
+
+            if better:
+                best_metric_sum = metric_sum
+                best_ratio_score = ratio_score
+                best_size_span = size_span
+                best_thresh = thr
+                best_cuts = cuts_try
+
+        if best_thresh is None or not best_cuts:
+            print(
+                "\n[Player1] No threshold produced a full set. Running once with thr=0.001."
+            )
+            self.flat_tol = 0.001
+            return self._plan_on_cake(self.cake)
+
+        print(
+            f"\n[Player1] Selected thr={best_thresh:.3f}  size_span={best_size_span:.5f}  ratio_score={best_ratio_score:.5f}  (sum={best_metric_sum:.5f})\n"
+        )
+
+        # replay best threshold on the REAL cake and return its cuts
+        self.flat_tol = best_thresh
+        return self._plan_on_cake(self.cake)
+
+    def get_max_piece(self, pieces: list[Polygon]) -> Polygon:
+        """Return largest polygon from list"""
+        return max(pieces, key=lambda piece: piece.area)
